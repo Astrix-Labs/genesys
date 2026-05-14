@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any
 
@@ -63,6 +64,13 @@ class MCPToolHandler:
         self.event_bus = event_bus
         self.on_change = on_change
         self.preferences = CoreMemoryPreferences(cache)
+
+    def _defer_saves(self):
+        """Return a context manager that batches saves if the graph supports it."""
+        for cls in type(self.graph).__mro__:
+            if 'defer_saves' in cls.__dict__:
+                return self.graph.defer_saves()
+        return nullcontext()
 
     async def _notify(self, event_type: str, data: dict[str, Any]) -> None:
         if self.on_change:
@@ -139,26 +147,27 @@ class MCPToolHandler:
             try:
                 org_ids = current_org_ids.get([])
                 similar = await self.graph.vector_search(embedding, k=4, org_ids=org_ids)
-                for other_node, score in similar:
-                    if str(other_node.id) == node_id:
-                        continue
-                    if score < 0.3:
-                        continue
-                    # Org boundary rule: org nodes only link to same-org nodes
-                    if vis == Visibility.ORG:
-                        if other_node.visibility != Visibility.ORG or other_node.org_id != org_id:
+                with self._defer_saves():
+                    for other_node, score in similar:
+                        if str(other_node.id) == node_id:
                             continue
-                    already = await self.graph.edge_exists(node_id, str(other_node.id), EdgeType.RELATED_TO)
-                    if not already:
-                        edge = MemoryEdge(
-                            source_id=node.id,
-                            target_id=other_node.id,
-                            type=EdgeType.RELATED_TO,
-                            weight=round(score, 4),
-                            reason=f"cosine similarity {score:.3f}",
-                            created_by="auto_link",
-                        )
-                        await self.graph.create_edge(edge)
+                        if score < 0.3:
+                            continue
+                        # Org boundary rule: org nodes only link to same-org nodes
+                        if vis == Visibility.ORG:
+                            if other_node.visibility != Visibility.ORG or other_node.org_id != org_id:
+                                continue
+                        already = await self.graph.edge_exists(node_id, str(other_node.id), EdgeType.RELATED_TO)
+                        if not already:
+                            edge = MemoryEdge(
+                                source_id=node.id,
+                                target_id=other_node.id,
+                                type=EdgeType.RELATED_TO,
+                                weight=round(score, 4),
+                                reason=f"cosine similarity {score:.3f}",
+                                created_by="auto_link",
+                            )
+                            await self.graph.create_edge(edge)
             except Exception:
                 logger.warning("Auto-linking failed for node %s", node_id, exc_info=True)
 
@@ -282,33 +291,33 @@ class MCPToolHandler:
         cap = max_results if max_results is not None else k
         memories = memories[:cap]
 
-        # Update reactivation state for returned nodes (skip in read_only mode)
+        # Update reactivation state + validate co-retrieval edges (skip in read_only mode)
         if not read_only:
-            now = datetime.now(timezone.utc)
-            for mem in memories:
-                mem_id = mem.get("id")
-                if not mem_id:
-                    continue
-                try:
-                    recalled = await self.graph.get_node(mem_id)
-                    if recalled:
-                        stability_delta = 0.1 / recalled.stability
-                        await self.graph.atomic_reactivation_update(mem_id, now, stability_delta)
-                        mem["reactivation_count"] = recalled.reactivation_count + 1
-                except Exception:
-                    logger.warning("Reactivation update failed for node %s", mem_id, exc_info=True)
+            with self._defer_saves():
+                now = datetime.now(timezone.utc)
+                for mem in memories:
+                    mem_id = mem.get("id")
+                    if not mem_id:
+                        continue
+                    try:
+                        recalled = await self.graph.get_node(mem_id)
+                        if recalled:
+                            stability_delta = 0.1 / recalled.stability
+                            await self.graph.atomic_reactivation_update(mem_id, now, stability_delta)
+                            mem["reactivation_count"] = recalled.reactivation_count + 1
+                    except Exception:
+                        logger.warning("Reactivation update failed for node %s", mem_id, exc_info=True)
 
-        # Validate edges between co-retrieved nodes (skip in read_only mode)
-        if not read_only and len(memories) > 1:
-            recalled_ids = {m["id"] for m in memories if m.get("id")}
-            try:
-                all_edges = await self.graph.get_all_edges(list(recalled_ids))
-                for edge in all_edges:
-                    src, tgt = str(edge.source_id), str(edge.target_id)
-                    if src in recalled_ids and tgt in recalled_ids:
-                        await self.graph.validate_edge(str(edge.id))
-            except Exception:
-                logger.warning("Co-retrieval edge validation failed", exc_info=True)
+                if len(memories) > 1:
+                    recalled_ids = {m["id"] for m in memories if m.get("id")}
+                    try:
+                        all_edges = await self.graph.get_all_edges(list(recalled_ids))
+                        for edge in all_edges:
+                            src, tgt = str(edge.source_id), str(edge.target_id)
+                            if src in recalled_ids and tgt in recalled_ids:
+                                await self.graph.validate_edge(str(edge.id))
+                    except Exception:
+                        logger.warning("Co-retrieval edge validation failed", exc_info=True)
 
         return {"query": query, "results": memories, "count": len(memories)}
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,14 +47,23 @@ class InMemoryGraphProvider:
 
     If ``persist_path`` is set, state is saved to / loaded from that JSON file
     so data survives across process restarts (e.g. separate ``claude -p`` calls).
+
+    Performance: edges are indexed by source_id and target_id for O(degree)
+    lookups instead of O(total_edges) scans. Disk writes are batched within
+    ``defer_saves()`` contexts.
     """
 
     def __init__(self, persist_path: str | None = None):
-        # Per-user storage: {user_id: {node_id: MemoryNode}}
         self._user_nodes: dict[str, dict[str, MemoryNode]] = {}
         self._user_edges: dict[str, list[MemoryEdge]] = {}
         self._persist_path = Path(persist_path) if persist_path else None
         self._node_locks: dict[str, asyncio.Lock] = {}
+        # Edge indexes: {user_id: {node_id: [edges]}}
+        self._idx_by_source: dict[str, dict[str, list[MemoryEdge]]] = {}
+        self._idx_by_target: dict[str, dict[str, list[MemoryEdge]]] = {}
+        # Save batching: defer disk writes until outermost defer_saves() exits
+        self._save_depth = 0
+        self._dirty = False
 
     @property
     def nodes(self) -> dict[str, MemoryNode]:
@@ -74,6 +85,86 @@ class InMemoryGraphProvider:
     def edges(self, value: list[MemoryEdge]) -> None:
         uid = _uid()
         self._user_edges[uid] = value
+        self._idx_by_source.pop(uid, None)
+        self._idx_by_target.pop(uid, None)
+        for edge in value:
+            self._index_edge(uid, edge)
+
+    # -- Edge index maintenance -------------------------------------------------
+
+    def _index_edge(self, uid: str, edge: MemoryEdge) -> None:
+        src, tgt = str(edge.source_id), str(edge.target_id)
+        self._idx_by_source.setdefault(uid, {}).setdefault(src, []).append(edge)
+        self._idx_by_target.setdefault(uid, {}).setdefault(tgt, []).append(edge)
+
+    def _unindex_edge(self, uid: str, edge: MemoryEdge) -> None:
+        eid = str(edge.id)
+        src, tgt = str(edge.source_id), str(edge.target_id)
+        src_list = self._idx_by_source.get(uid, {}).get(src)
+        if src_list is not None:
+            self._idx_by_source[uid][src] = [e for e in src_list if str(e.id) != eid]
+        tgt_list = self._idx_by_target.get(uid, {}).get(tgt)
+        if tgt_list is not None:
+            self._idx_by_target[uid][tgt] = [e for e in tgt_list if str(e.id) != eid]
+
+    def _rebuild_indexes(self) -> None:
+        self._idx_by_source.clear()
+        self._idx_by_target.clear()
+        for uid, edge_list in self._user_edges.items():
+            for edge in edge_list:
+                self._index_edge(uid, edge)
+
+    def _edges_touching(self, node_id: str, uid: str | None = None) -> list[MemoryEdge]:
+        """All edges from a single user touching a node (by source or target)."""
+        if uid is None:
+            uid = _uid()
+        seen: set[str] = set()
+        result: list[MemoryEdge] = []
+        for e in self._idx_by_source.get(uid, {}).get(node_id, []):
+            eid = str(e.id)
+            if eid not in seen:
+                result.append(e)
+                seen.add(eid)
+        for e in self._idx_by_target.get(uid, {}).get(node_id, []):
+            eid = str(e.id)
+            if eid not in seen:
+                result.append(e)
+                seen.add(eid)
+        return result
+
+    # -- Save batching ----------------------------------------------------------
+
+    @contextmanager
+    def defer_saves(self):
+        """Batch disk writes. All mutations inside this context share one write."""
+        self._save_depth += 1
+        try:
+            yield
+        finally:
+            self._save_depth -= 1
+            if self._save_depth == 0 and self._dirty:
+                self._do_save()
+                self._dirty = False
+
+    def _save(self) -> None:
+        if self._save_depth > 0:
+            self._dirty = True
+            return
+        self._do_save()
+
+    def _do_save(self) -> None:
+        if not self._persist_path:
+            return
+        self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        for uid, nodes in self._user_nodes.items():
+            data[uid] = {
+                "nodes": {nid: n.model_dump(mode="json") for nid, n in nodes.items()},
+                "edges": [e.model_dump(mode="json") for e in self._user_edges.get(uid, [])],
+            }
+        self._persist_path.write_text(_json.dumps(data))
+
+    # -- Org visibility ---------------------------------------------------------
 
     def _get_org_ids(self, org_ids: list[str] | None = None) -> list[str]:
         if org_ids is not None:
@@ -85,11 +176,12 @@ class InMemoryGraphProvider:
         result = dict(self.nodes)
         oids = self._get_org_ids(org_ids)
         if oids:
+            oid_set = set(oids)
             for uid, user_nodes in self._user_nodes.items():
                 if uid == _uid():
                     continue
                 for nid, node in user_nodes.items():
-                    if node.visibility == Visibility.ORG and node.org_id in oids:
+                    if node.visibility == Visibility.ORG and node.org_id in oid_set:
                         result[nid] = node
         return result
 
@@ -129,19 +221,33 @@ class InMemoryGraphProvider:
                     seen_edge_ids.add(eid)
         return result
 
-    # -- persistence helpers --------------------------------------------------
+    def _visible_edges_for_node(self, node_id: str, visible_ids: set[str] | None = None, org_ids: list[str] | None = None) -> list[MemoryEdge]:
+        """Get visible edges touching a node using indexes instead of full scan."""
+        uid = _uid()
+        if visible_ids is None:
+            visible_ids = set(self._visible_nodes(org_ids).keys())
+        result: list[MemoryEdge] = []
+        seen: set[str] = set()
 
-    def _save(self) -> None:
-        if not self._persist_path:
-            return
-        self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {}
-        for uid, nodes in self._user_nodes.items():
-            data[uid] = {
-                "nodes": {nid: n.model_dump(mode="json") for nid, n in nodes.items()},
-                "edges": [e.model_dump(mode="json") for e in self._user_edges.get(uid, [])],
-            }
-        self._persist_path.write_text(_json.dumps(data))
+        for user_uid in self._user_edges:
+            is_own = user_uid == uid
+            for e in self._idx_by_source.get(user_uid, {}).get(node_id, []):
+                eid = str(e.id)
+                if eid in seen:
+                    continue
+                if is_own or str(e.target_id) in visible_ids:
+                    result.append(e)
+                    seen.add(eid)
+            for e in self._idx_by_target.get(user_uid, {}).get(node_id, []):
+                eid = str(e.id)
+                if eid in seen:
+                    continue
+                if is_own or str(e.source_id) in visible_ids:
+                    result.append(e)
+                    seen.add(eid)
+        return result
+
+    # -- Persistence ------------------------------------------------------------
 
     def _load(self) -> None:
         if not self._persist_path or not self._persist_path.exists():
@@ -158,6 +264,7 @@ class InMemoryGraphProvider:
             for uid, user_data in raw.items():
                 self._user_nodes[uid] = {nid: MemoryNode(**v) for nid, v in user_data.get("nodes", {}).items()}
                 self._user_edges[uid] = [MemoryEdge(**e) for e in user_data.get("edges", [])]
+        self._rebuild_indexes()
 
     async def initialize(self, user_id: str) -> None:
         self._load()
@@ -165,6 +272,8 @@ class InMemoryGraphProvider:
     async def destroy(self, user_id: str) -> None:
         self._user_nodes.pop(user_id, None)
         self._user_edges.pop(user_id, None)
+        self._idx_by_source.pop(user_id, None)
+        self._idx_by_target.pop(user_id, None)
         self._save()
 
     async def erase_user(self, user_id: str, keep_promoted_nodes: bool = True) -> dict[str, int]:
@@ -242,6 +351,7 @@ class InMemoryGraphProvider:
             self._user_edges.pop(user_id, None)
 
         self._node_locks = {k: v for k, v in self._node_locks.items() if k not in delete_ids}
+        self._rebuild_indexes()
         self._save()
         return {
             "nodes_deleted": nodes_deleted,
@@ -249,6 +359,8 @@ class InMemoryGraphProvider:
             "edges_deleted": edges_deleted,
             "edges_scrubbed": edges_scrubbed,
         }
+
+    # -- Node CRUD --------------------------------------------------------------
 
     async def create_node(self, node: MemoryNode) -> str:
         nid = str(node.id)
@@ -277,39 +389,66 @@ class InMemoryGraphProvider:
 
     async def delete_node(self, node_id: str) -> None:
         self.nodes.pop(node_id, None)
-        self.edges = [e for e in self.edges if str(e.source_id) != node_id and str(e.target_id) != node_id]
+        uid = _uid()
+        removed = [e for e in self._user_edges.get(uid, [])
+                    if str(e.source_id) == node_id or str(e.target_id) == node_id]
+        for e in removed:
+            self._unindex_edge(uid, e)
+        self._user_edges[uid] = [e for e in self._user_edges.get(uid, [])
+                                  if str(e.source_id) != node_id and str(e.target_id) != node_id]
         self._save()
 
     async def get_nodes_by_status(self, status: MemoryStatus, limit: int = 100) -> list[MemoryNode]:
         visible = self._visible_nodes()
         return [n for n in visible.values() if n.status == status][:limit]
 
+    # -- Edge CRUD --------------------------------------------------------------
+
     async def create_edge(self, edge: MemoryEdge) -> str:
-        self.edges.append(edge)
+        uid = _uid()
+        self._user_edges.setdefault(uid, []).append(edge)
+        self._index_edge(uid, edge)
         self._save()
         return str(edge.id)
 
     async def get_edges(self, node_id: str, direction: str, edge_type: EdgeType | None = None) -> list[MemoryEdge]:
-        result = []
-        for e in self.edges:
-            src, tgt = str(e.source_id), str(e.target_id)
-            match = False
-            if direction in ("out", "both") and src == node_id:
-                match = True
-            if direction in ("in", "both") and tgt == node_id:
-                match = True
-            if match and (edge_type is None or e.type == edge_type):
-                result.append(e)
+        uid = _uid()
+        result: list[MemoryEdge] = []
+        seen: set[str] = set()
+        if direction in ("out", "both"):
+            for e in self._idx_by_source.get(uid, {}).get(node_id, []):
+                if edge_type is None or e.type == edge_type:
+                    eid = str(e.id)
+                    if eid not in seen:
+                        result.append(e)
+                        seen.add(eid)
+        if direction in ("in", "both", "incoming"):
+            for e in self._idx_by_target.get(uid, {}).get(node_id, []):
+                if edge_type is None or e.type == edge_type:
+                    eid = str(e.id)
+                    if eid not in seen:
+                        result.append(e)
+                        seen.add(eid)
         return result
 
     async def get_all_edges(self, node_ids: list[str] | None = None) -> list[MemoryEdge]:
+        uid = _uid()
         if node_ids is None:
-            return list(self.edges)
+            return list(self._user_edges.get(uid, []))
         ids = set(node_ids)
-        return [e for e in self.edges if str(e.source_id) in ids or str(e.target_id) in ids]
+        seen: set[str] = set()
+        result: list[MemoryEdge] = []
+        for nid in ids:
+            for e in self._edges_touching(nid, uid):
+                eid = str(e.id)
+                if eid not in seen:
+                    result.append(e)
+                    seen.add(eid)
+        return result
 
     async def update_edge_weight(self, edge_id: str, weight: float) -> None:
-        for e in self.edges:
+        uid = _uid()
+        for e in self._user_edges.get(uid, []):
             if str(e.id) == edge_id:
                 e.weight = weight
                 self._save()
@@ -317,25 +456,35 @@ class InMemoryGraphProvider:
 
     async def validate_edge(self, edge_id: str) -> None:
         from datetime import datetime, timezone
-        for e in self.edges:
+        uid = _uid()
+        for e in self._user_edges.get(uid, []):
             if str(e.id) == edge_id:
                 e.last_validated_at = datetime.now(timezone.utc)
                 self._save()
                 return
 
     async def delete_edge(self, edge_id: str) -> None:
-        self.edges = [e for e in self.edges if str(e.id) != edge_id]
+        uid = _uid()
+        edge_list = self._user_edges.get(uid, [])
+        for e in edge_list:
+            if str(e.id) == edge_id:
+                self._unindex_edge(uid, e)
+                break
+        self._user_edges[uid] = [e for e in edge_list if str(e.id) != edge_id]
         self._save()
 
     async def edge_exists(self, source_id: str, target_id: str, edge_type: EdgeType) -> bool:
-        return any(
-            str(e.source_id) == source_id and str(e.target_id) == target_id and e.type == edge_type
-            for e in self.edges
-        )
+        uid = _uid()
+        for e in self._idx_by_source.get(uid, {}).get(source_id, []):
+            if str(e.target_id) == target_id and e.type == edge_type:
+                return True
+        return False
+
+    # -- Graph queries (indexed) ------------------------------------------------
 
     async def traverse(self, start_id: str, depth: int, edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None) -> list[MemoryNode]:
         visible = self._visible_nodes(org_ids)
-        all_edges = self._all_visible_edges(org_ids)
+        visible_ids = set(visible.keys())
         visited: set[str] = set()
         queue = [(start_id, 0)]
         result: list[MemoryNode] = []
@@ -348,22 +497,18 @@ class InMemoryGraphProvider:
             if node:
                 result.append(node)
             if d < depth:
-                for e in all_edges:
-                    src, tgt = str(e.source_id), str(e.target_id)
+                for e in self._visible_edges_for_node(nid, visible_ids, org_ids):
                     if edge_types and e.type not in edge_types:
                         continue
-                    next_id = None
-                    if src == nid and tgt not in visited:
-                        next_id = tgt
-                    elif tgt == nid and src not in visited:
-                        next_id = src
-                    if next_id and next_id in visible:
+                    src, tgt = str(e.source_id), str(e.target_id)
+                    next_id = tgt if src == nid else src
+                    if next_id not in visited and next_id in visible_ids:
                         queue.append((next_id, d + 1))
         return result
 
     async def get_causal_chain(self, node_id: str, direction: str, org_ids: list[str] | None = None) -> list[MemoryNode]:
         visible = self._visible_nodes(org_ids)
-        all_edges = self._all_visible_edges(org_ids)
+        visible_ids = set(visible.keys())
         visited: set[str] = set()
         queue = [node_id]
         result: list[MemoryNode] = []
@@ -372,7 +517,7 @@ class InMemoryGraphProvider:
             if nid in visited:
                 continue
             visited.add(nid)
-            for e in all_edges:
+            for e in self._visible_edges_for_node(nid, visible_ids, org_ids):
                 if e.type not in CAUSAL_EDGE_TYPES:
                     continue
                 src, tgt = str(e.source_id), str(e.target_id)
@@ -381,7 +526,7 @@ class InMemoryGraphProvider:
                     next_id = src
                 elif direction == "downstream" and src == nid and tgt not in visited:
                     next_id = tgt
-                if next_id and next_id in visible:
+                if next_id and next_id in visible_ids:
                     queue.append(next_id)
                     node = visible.get(next_id)
                     if node:
@@ -390,37 +535,34 @@ class InMemoryGraphProvider:
 
     async def get_causal_weight(self, node_id: str) -> int:
         count = 0
-        for e in self.edges:
+        for e in self._edges_touching(node_id):
             if e.type in CAUSAL_EDGE_TYPES:
-                if str(e.source_id) == node_id or str(e.target_id) == node_id:
-                    count += 1
-        return count
-
-    async def get_degree(self, node_id: str) -> int:
-        count = 0
-        for e in self.edges:
-            if str(e.source_id) == node_id or str(e.target_id) == node_id:
                 count += 1
         return count
 
+    async def get_degree(self, node_id: str) -> int:
+        return len(self._edges_touching(node_id))
+
     async def get_supportive_degree(self, node_id: str) -> int:
         count = 0
-        for e in self.edges:
+        for e in self._edges_touching(node_id):
             if e.type in SUPPORTIVE_EDGE_TYPES:
-                if str(e.source_id) == node_id or str(e.target_id) == node_id:
-                    count += 1
+                count += 1
         return count
 
     async def is_orphan(self, node_id: str) -> bool:
         return (await self.get_supportive_degree(node_id)) == 0
 
     async def get_orphans(self) -> list[MemoryNode]:
-        supported = set()
-        for e in self.edges:
+        uid = _uid()
+        supported: set[str] = set()
+        for e in self._user_edges.get(uid, []):
             if e.type in SUPPORTIVE_EDGE_TYPES:
                 supported.add(str(e.source_id))
                 supported.add(str(e.target_id))
         return [n for nid, n in self.nodes.items() if nid not in supported]
+
+    # -- Search -----------------------------------------------------------------
 
     async def vector_search(
         self, embedding: list[float], k: int = 10, status_filter: list[MemoryStatus] | None = None, org_ids: list[str] | None = None,
@@ -444,6 +586,8 @@ class InMemoryGraphProvider:
             if query_lower in (node.content_full or node.content_summary).lower():
                 results.append(node)
         return results[:k]
+
+    # -- Misc -------------------------------------------------------------------
 
     async def store_embedding(self, node_id: str, embedding: list[float]) -> None:
         node = self.nodes.get(node_id)
@@ -481,13 +625,12 @@ class InMemoryGraphProvider:
             self._save()
 
     async def get_stats(self) -> dict[str, Any]:
-        max_cw = 0
-        for nid in self.nodes:
-            cw = 0
-            for e in self.edges:
-                if e.type in CAUSAL_EDGE_TYPES:
-                    if str(e.source_id) == nid or str(e.target_id) == nid:
-                        cw += 1
-            if cw > max_cw:
-                max_cw = cw
-        return {"nodes": len(self.nodes), "edges": len(self.edges), "max_causal_weight": max_cw}
+        uid = _uid()
+        edges = self._user_edges.get(uid, [])
+        causal_counts: dict[str, int] = defaultdict(int)
+        for e in edges:
+            if e.type in CAUSAL_EDGE_TYPES:
+                causal_counts[str(e.source_id)] += 1
+                causal_counts[str(e.target_id)] += 1
+        max_cw = max(causal_counts.values()) if causal_counts else 0
+        return {"nodes": len(self.nodes), "edges": len(edges), "max_causal_weight": max_cw}
