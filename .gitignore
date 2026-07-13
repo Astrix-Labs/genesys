@@ -44,6 +44,8 @@ data/
 # Benchmark data files (large datasets)
 benchmarks/locomo10.json
 benchmarks/locomo_eval_results.json
+benchmarks/locomo_judged.json
+benchmarks/.genesys_state*.json
 
 # Internal docs (not for OSS)
 phases/
@@ -61,6 +63,10 @@ prompts/
 
 # State snapshots
 .genesys_state*.json
+
+# Database migrations (production only)
+alembic/
+alembic.ini
 
 # Handoff docs
 genesys-neuro-handoff/

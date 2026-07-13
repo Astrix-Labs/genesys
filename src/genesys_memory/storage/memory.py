@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Generator
 
 from genesys_memory.context import current_org_ids, current_user_id
-from genesys_memory.engine.scoring import cosine_similarity
 from genesys_memory.models.edge import MemoryEdge
 from genesys_memory.models.enums import CAUSAL_EDGE_TYPES, SUPPORTIVE_EDGE_TYPES, EdgeType, MemoryStatus, Visibility
 from genesys_memory.models.node import MemoryNode
@@ -21,6 +20,30 @@ def _uid() -> str:
     if uid is None:
         raise RuntimeError("No user context — current_user_id not set")
     return uid
+
+
+def _stem(word: str) -> str:
+    """Minimal suffix-stripping stemmer (no deps)."""
+    if word.endswith("ing") and len(word) > 5:
+        return word[:-3]
+    if word.endswith("tion") and len(word) > 5:
+        return word[:-4]
+    if word.endswith("ed") and len(word) > 4:
+        return word[:-2]
+    if word.endswith("ly") and len(word) > 4:
+        return word[:-2]
+    if word.endswith("es") and len(word) > 4:
+        return word[:-2]
+    if word.endswith("s") and len(word) > 3 and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _tokenize(text: str) -> list[str]:
+    """Split text into stemmed tokens, stripping punctuation."""
+    import re
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return [_stem(w) for w in words if len(w) > 2]
 
 
 class InMemoryCacheProvider:
@@ -533,6 +556,39 @@ class InMemoryGraphProvider:
                         result.append(node)
         return result
 
+    async def get_causal_chains_batch(
+        self, node_ids: list[str], direction: str, org_ids: list[str] | None = None,
+    ) -> dict[str, list[MemoryNode]]:
+        """BFS from all seed nodes simultaneously, sharing one visibility scan."""
+        visible = self._visible_nodes(org_ids)
+        visible_ids = set(visible.keys())
+        result: dict[str, list[MemoryNode]] = {nid: [] for nid in node_ids}
+        visited: dict[str, set[str]] = {nid: set() for nid in node_ids}
+
+        for seed_id in node_ids:
+            queue = [seed_id]
+            seen = visited[seed_id]
+            while queue:
+                nid = queue.pop(0)
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                for e in self._visible_edges_for_node(nid, visible_ids, org_ids):
+                    if e.type not in CAUSAL_EDGE_TYPES:
+                        continue
+                    src, tgt = str(e.source_id), str(e.target_id)
+                    next_id = None
+                    if direction == "upstream" and tgt == nid and src not in seen:
+                        next_id = src
+                    elif direction == "downstream" and src == nid and tgt not in seen:
+                        next_id = tgt
+                    if next_id and next_id in visible_ids:
+                        queue.append(next_id)
+                        node = visible.get(next_id)
+                        if node:
+                            result[seed_id].append(node)
+        return result
+
     async def get_causal_weight(self, node_id: str) -> int:
         count = 0
         for e in self._edges_touching(node_id):
@@ -567,25 +623,55 @@ class InMemoryGraphProvider:
     async def vector_search(
         self, embedding: list[float], k: int = 10, status_filter: list[MemoryStatus] | None = None, org_ids: list[str] | None = None,
     ) -> list[tuple[MemoryNode, float]]:
+        import numpy as np
+
         visible = self._visible_nodes(org_ids)
-        scored = []
+        nodes_with_emb: list[MemoryNode] = []
         for node in visible.values():
             if status_filter and node.status not in status_filter:
                 continue
             if node.embedding:
-                sim = cosine_similarity(embedding, node.embedding)
-                scored.append((node, sim))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:k]
+                nodes_with_emb.append(node)
+        if not nodes_with_emb:
+            return []
+
+        query_vec = np.asarray(embedding, dtype=np.float32)
+        query_norm = np.linalg.norm(query_vec)
+        if query_norm == 0:
+            return []
+
+        matrix = np.array([n.embedding for n in nodes_with_emb], dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1)
+        norms[norms == 0] = 1.0
+        sims = (matrix @ query_vec) / (norms * query_norm)
+
+        top_k = min(k, len(sims))
+        top_indices = np.argpartition(sims, -top_k)[-top_k:]
+        top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
+
+        return [(nodes_with_emb[i], float(sims[i])) for i in top_indices]
 
     async def keyword_search(self, query: str, entity_refs: list[str] | None = None, k: int = 10, org_ids: list[str] | None = None) -> list[MemoryNode]:
         visible = self._visible_nodes(org_ids)
-        query_lower = query.lower()
-        results = []
+        query_terms = _tokenize(query)
+        if not query_terms:
+            return []
+        scored: list[tuple[MemoryNode, float]] = []
         for node in visible.values():
-            if query_lower in (node.content_full or node.content_summary).lower():
-                results.append(node)
-        return results[:k]
+            content = (node.content_full or node.content_summary).lower()
+            content_tokens = set(content.split())
+            hits = sum(1 for t in query_terms if any(t in tok for tok in content_tokens))
+            entity_hits = 0
+            if node.entity_refs:
+                node_entities_lower = [e.lower() for e in node.entity_refs]
+                entity_hits = sum(
+                    1 for t in query_terms if any(t in ent for ent in node_entities_lower)
+                )
+            total = hits + entity_hits
+            if total > 0:
+                scored.append((node, total / len(query_terms)))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [node for node, _ in scored[:k]]
 
     # -- Misc -------------------------------------------------------------------
 
@@ -634,3 +720,27 @@ class InMemoryGraphProvider:
                 causal_counts[str(e.target_id)] += 1
         max_cw = max(causal_counts.values()) if causal_counts else 0
         return {"nodes": len(self.nodes), "edges": len(edges), "max_causal_weight": max_cw}
+
+
+class InMemoryEventBusProvider:
+    """EventBusProvider that dispatches handlers as background tasks."""
+
+    def __init__(self) -> None:
+        self._subscribers: dict[str, list[Any]] = defaultdict(list)
+
+    async def publish(self, channel: str, payload: dict[str, Any]) -> None:
+        for handler in self._subscribers.get(channel, []):
+            asyncio.create_task(self._safe_call(handler, payload))
+
+    async def subscribe(self, channel: str, handler: Any) -> None:
+        self._subscribers[channel].append(handler)
+
+    @staticmethod
+    async def _safe_call(handler: Any, payload: dict[str, Any]) -> None:
+        import logging
+        try:
+            await handler(payload)
+        except Exception:
+            logging.getLogger(__name__).error(
+                "Event handler failed", exc_info=True,
+            )

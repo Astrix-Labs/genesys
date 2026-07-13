@@ -43,6 +43,9 @@ dev = [
     "mypy>=1.10.0",
 ]
 
+[project.scripts]
+genesys-memory = "genesys_memory.__main__:main"
+
 [project.urls]
 Homepage = "https://github.com/rishimeka/genesys"
 Repository = "https://github.com/rishimeka/genesys"

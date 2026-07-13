@@ -27,6 +27,18 @@ class LocalEmbeddingProvider:
     def dimension(self) -> int:
         return self.DIMENSION
 
+    # Local MiniLM cosine similarities cluster much lower than OpenAI's
+    # text-embedding-3-small for genuine matches (empirically ~0.2-0.4 vs
+    # ~0.5+), so recall/core-injection thresholds must consult this instead
+    # of assuming an OpenAI-tuned floor.
+    @property
+    def recommended_min_similarity(self) -> float:
+        return 0.2
+
+    @property
+    def recommended_core_min_similarity(self) -> float:
+        return 0.2
+
     async def embed(self, text: str) -> list[float]:
         self._load_model()
         vec: list[float] = self._model.encode(text, normalize_embeddings=True).tolist()
@@ -52,6 +64,17 @@ class OpenAIEmbeddingProvider:
     @property
     def dimension(self) -> int:
         return self.DIMENSION
+
+    # text-embedding-3-small produces well-separated cosine similarities for
+    # genuine matches; these are the thresholds the LoCoMo benchmark was
+    # tuned against.
+    @property
+    def recommended_min_similarity(self) -> float:
+        return 0.5
+
+    @property
+    def recommended_core_min_similarity(self) -> float:
+        return 0.45
 
     def _cache_key(self, text: str) -> str:
         return f"embed:{hashlib.sha256(text.encode()).hexdigest()}"

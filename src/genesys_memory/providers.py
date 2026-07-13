@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 from genesys_memory.mcp.tools import MCPToolHandler
 from genesys_memory.storage.base import CacheProvider, EmbeddingProvider, EventBusProvider, GraphStorageProvider
-from genesys_memory.storage.memory import InMemoryCacheProvider, InMemoryGraphProvider
+from genesys_memory.storage.memory import InMemoryCacheProvider, InMemoryEventBusProvider, InMemoryGraphProvider
 
 load_dotenv()
 
@@ -35,22 +35,35 @@ _instance: Providers | None = None
 def _make_embedder() -> EmbeddingProvider | None:
     """Create embedding provider based on GENESYS_EMBEDDER env var.
 
-    Falls back gracefully when optional dependencies are missing.
+    Falls back gracefully when optional dependencies or credentials are
+    missing: openai -> local (if sentence-transformers is installed) ->
+    None (keyword-only recall). Never constructs an OpenAI client without a
+    usable API key — the client itself doesn't validate the key, so an
+    empty/missing key would otherwise surface as an auth error on the first
+    embed() call instead of failing gracefully here.
     """
     embedder = os.getenv("GENESYS_EMBEDDER", "openai")
+
     if embedder == "local":
         try:
             from genesys_memory.retrieval.embedding import LocalEmbeddingProvider
             return LocalEmbeddingProvider()
         except ImportError:
-            pass
-    else:
+            return None
+
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if api_key:
         try:
             from genesys_memory.retrieval.embedding import OpenAIEmbeddingProvider
-            return OpenAIEmbeddingProvider(api_key=os.getenv("OPENAI_API_KEY", ""))
+            return OpenAIEmbeddingProvider(api_key=api_key)
         except ImportError:
             pass
-    return None
+
+    try:
+        from genesys_memory.retrieval.embedding import LocalEmbeddingProvider
+        return LocalEmbeddingProvider()
+    except ImportError:
+        return None
 
 
 def get_providers() -> Providers:
@@ -72,14 +85,26 @@ def get_providers() -> Providers:
         from genesys_memory.engine.llm_provider import AnthropicLLMProvider
         llm_provider = AnthropicLLMProvider(api_key=anthropic_key)
 
-    tools = MCPToolHandler(graph=graph, embeddings=embeddings, cache=cache)
+    event_bus = InMemoryEventBusProvider()
+
+    if llm_provider:
+        from genesys_memory.engine.background import register_handlers
+        register_handlers(event_bus, graph, llm_provider, embeddings)
+
+    tools = MCPToolHandler(
+        graph=graph,
+        embeddings=embeddings,
+        cache=cache,
+        event_bus=event_bus,
+        llm=llm_provider,
+    )
 
     _instance = Providers(
         graph=graph,
         cache=cache,
         embeddings=embeddings,
         llm=llm_provider,
-        event_bus=None,
+        event_bus=event_bus,
         tools=tools,
         user_id=user_id,
     )
