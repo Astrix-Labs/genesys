@@ -57,12 +57,14 @@ class MCPToolHandler:
         cache: CacheProvider,
         event_bus: EventBusProvider | None = None,
         on_change: Callable[..., Any] | None = None,
+        llm: object | None = None,
     ):
         self.graph = graph
         self.embeddings = embeddings
         self.cache = cache
         self.event_bus = event_bus
         self.on_change = on_change
+        self.llm = llm
         self.preferences = CoreMemoryPreferences(cache)
 
     def _defer_saves(self) -> AbstractContextManager[None]:
@@ -201,29 +203,42 @@ class MCPToolHandler:
             k = MAX_K
 
         # Extract keyword terms while embedding runs
-        _stopwords = {
-            "what", "when", "where", "who", "how", "why", "which", "does", "did",
-            "has", "have", "had", "was", "were", "are", "is", "the", "a", "an",
-            "in", "on", "at", "to", "for", "of", "and", "or", "do", "been",
+        _base_stopwords = {
+            "what", "where", "who", "how", "why", "which", "does", "did",
+            "have", "are", "is", "the", "a", "an",
+            "in", "on", "at", "to", "for", "of", "and", "or", "do",
             "from", "that", "this", "with", "about", "some", "any", "many",
             "much", "her", "his", "its", "their", "she", "he", "it", "they",
         }
-        terms = [w for w in query.lower().split() if w.strip("?.,!'\"") not in _stopwords and len(w) > 2]
+        _temporal_stopwords = {"when", "has", "had", "was", "were", "been"}
+        _temporal_signals = {
+            "before", "after", "first", "last", "recently", "ago",
+            "year", "month", "date", "time", "during", "until", "since",
+        }
+        query_lower = query.lower()
+        query_words = query_lower.split()
+        has_temporal = any(w.strip("?.,!'\"") in _temporal_signals for w in query_words)
+        _stopwords = _base_stopwords if has_temporal else _base_stopwords | _temporal_stopwords
+        terms = [w for w in query_words if w.strip("?.,!'\"") not in _stopwords and len(w) > 2]
 
         org_ids = current_org_ids.get([])
-        # Run embedding + all keyword searches concurrently
+        # Run embedding + all keyword searches concurrently. Keyword search
+        # coroutines are built once and MUST be awaited on every branch below
+        # (no-embedder recall still relies on the keyword path).
         kw_coros = [self.graph.keyword_search(t.strip("?.,!'\""), k=k, org_ids=org_ids) for t in terms[:5]]
-        if not self.embeddings:
-            return {"query": query, "results": [], "count": 0}
-        embed_and_kw: list[Any] = await asyncio.gather(self.embeddings.embed(query), *kw_coros)
-        embedding: list[float] = embed_and_kw[0]
-        kw_results_per_term: list[list[MemoryNode]] = embed_and_kw[1:]
+        if self.embeddings:
+            embed_and_kw: list[Any] = await asyncio.gather(self.embeddings.embed(query), *kw_coros)
+            embedding: list[float] = embed_and_kw[0]
+            kw_results_per_term: list[list[MemoryNode]] = embed_and_kw[1:]
+        else:
+            embedding = []
+            kw_results_per_term = await asyncio.gather(*kw_coros) if kw_coros else []
 
         # 1. Vector search (needs embedding)
         from genesys_memory.engine import config as engine_config
-        min_sim = engine_config.RECALL_MIN_SIMILARITY
+        min_sim = engine_config.resolve_recall_min_similarity(self.embeddings)
 
-        vector_results = await self.graph.vector_search(embedding, k=k, org_ids=org_ids)
+        vector_results = await self.graph.vector_search(embedding, k=k, org_ids=org_ids) if embedding else []
 
         # 2. Collect keyword hits
         kw_node_ids: set[str] = set()
@@ -240,21 +255,25 @@ class MCPToolHandler:
 
         vector_ids: set[str] = set()
         for node, score in vector_results:
-            if score < min_sim:
-                continue
             nid = str(node.id)
+            is_kw_hit = nid in kw_node_ids
+            # A lexical keyword match is its own independent relevance
+            # signal (stemmed term overlap with content), so it isn't
+            # gated by the vector-similarity floor — only pure vector
+            # matches are, to filter embedding noise.
+            if score < min_sim and not is_kw_hit:
+                continue
             vector_ids.add(nid)
-            merged[nid] = {"node": node, "vec_score": score, "in_both": nid in kw_node_ids}
+            merged[nid] = {"node": node, "vec_score": score, "in_both": is_kw_hit}
 
-        # Add keyword-only results — compute their vector similarity for ranking
+        # Add keyword-only results — compute their vector similarity for
+        # ranking only (not gated by min_sim; see comment above).
         for nid, node in kw_nodes_map.items():
             if nid not in merged:
                 if node.embedding and embedding:
                     vec_score = cosine_similarity(node.embedding, embedding)
                 else:
                     vec_score = 0.0
-                if vec_score < min_sim:
-                    continue
                 merged[nid] = {"node": node, "vec_score": vec_score, "in_both": False}
 
         # 4. Format results without causal chains first (defer expensive graph queries)
@@ -271,46 +290,66 @@ class MCPToolHandler:
             if self.event_bus and nid in vector_ids:
                 await self.event_bus.publish("memory.accessed", {"node_id": nid})
 
-        # Inject core memories not already in results (only if relevant to query)
-        core_min_sim = engine_config.CORE_INJECT_MIN_SIMILARITY
+        # Inject core memories not already in results. Auto-promoted core
+        # memories are only injected when relevant to the query (avoids
+        # noise); explicitly *pinned* memories are always injected — that's
+        # the contract of pin_memory (always available regardless of query).
+        core_min_sim = engine_config.resolve_core_inject_min_similarity(self.embeddings)
         core_nodes = await self.graph.get_nodes_by_status(MemoryStatus.CORE, limit=50)
         seen_ids = set(merged.keys())
+        core_candidates: list[tuple[MemoryNode, float]] = []
         for cnode in core_nodes:
             cid = str(cnode.id)
             if cid not in seen_ids:
                 core_sim = 0.0
                 if cnode.embedding and embedding:
                     core_sim = cosine_similarity(cnode.embedding, embedding)
-                if core_sim < core_min_sim:
-                    continue
-                node_by_id[cid] = cnode
-                mem = self._format_memory_light(cnode, core_sim)
-                mem["is_core"] = True
-                mem["_rank_score"] = core_sim
-                memories.append(mem)
+                if cnode.pinned or core_sim >= core_min_sim:
+                    core_candidates.append((cnode, core_sim))
+        core_candidates.sort(key=lambda x: (x[0].pinned, x[1]), reverse=True)
+        for cnode, core_sim in core_candidates[:10]:
+            cid = str(cnode.id)
+            node_by_id[cid] = cnode
+            mem = self._format_memory_light(cnode, core_sim)
+            mem["is_core"] = True
+            mem["_rank_score"] = core_sim
+            memories.append(mem)
 
-        # Batch superseded check: one get_all_edges call instead of N get_edges calls
+        # Batch superseded check + spreading activation: one get_all_edges call
         SUPERSEDED_DECAY = 0.3
+        SPREAD_BONUS = 0.05
         all_mem_ids = [m["id"] for m in memories if m.get("id")]
         if all_mem_ids:
             try:
                 all_mem_edges = await self.graph.get_all_edges(all_mem_ids)
                 superseded_map: dict[str, str] = {}
+                mem_id_set = set(all_mem_ids)
+                neighbor_counts: dict[str, int] = {}
                 for edge in all_mem_edges:
+                    tgt = str(edge.target_id)
+                    src = str(edge.source_id)
                     if edge.type == EdgeType.SUPERSEDES:
-                        tgt = str(edge.target_id)
-                        src = str(edge.source_id)
                         if tgt in node_by_id:
                             superseded_map[tgt] = src
                         elif src in node_by_id:
                             superseded_map[src] = tgt
+                    # Count edges between result set members for spreading activation
+                    if src in mem_id_set and tgt in mem_id_set:
+                        neighbor_counts[src] = neighbor_counts.get(src, 0) + 1
+                        neighbor_counts[tgt] = neighbor_counts.get(tgt, 0) + 1
                 for mem in memories:
                     mem_id = mem.get("id")
-                    if mem_id and mem_id in superseded_map:
+                    if not mem_id:
+                        continue
+                    if mem_id in superseded_map:
                         mem["_rank_score"] *= SUPERSEDED_DECAY
                         mem["superseded_by"] = superseded_map[mem_id]
+                    # Spreading activation: boost memories connected to other results
+                    spread = neighbor_counts.get(mem_id, 0)
+                    if spread > 0:
+                        mem["_rank_score"] += SPREAD_BONUS * spread
             except Exception:
-                logger.warning("Superseded check failed", exc_info=True)
+                logger.warning("Superseded/spreading check failed", exc_info=True)
 
         memories.sort(key=lambda m: m["_rank_score"], reverse=True)
         for mem in memories:
@@ -320,39 +359,50 @@ class MCPToolHandler:
         cap = max_results if max_results is not None else k
         memories = memories[:cap]
 
-        # Enrich top results with causal chains (parallel fetch instead of serial)
+        # Enrich top results with causal chains (batch fetch)
         org_ids_for_chain = current_org_ids.get([])
         mem_ids_for_chain = [m["id"] for m in memories if m.get("id")]
         if mem_ids_for_chain:
             try:
-                chain_coros = []
+                has_batch = hasattr(self.graph, "get_causal_chains_batch")
+                if has_batch:
+                    upstream_map, downstream_map = await asyncio.gather(
+                        self.graph.get_causal_chains_batch(mem_ids_for_chain, "upstream", org_ids=org_ids_for_chain),
+                        self.graph.get_causal_chains_batch(mem_ids_for_chain, "downstream", org_ids=org_ids_for_chain),
+                    )
+                else:
+                    chain_coros = []
+                    for mid in mem_ids_for_chain:
+                        chain_coros.append(self.graph.get_causal_chain(mid, "upstream", org_ids=org_ids_for_chain))
+                        chain_coros.append(self.graph.get_causal_chain(mid, "downstream", org_ids=org_ids_for_chain))
+                    chain_results = await asyncio.gather(*chain_coros, return_exceptions=True)
+                    upstream_map = {}
+                    downstream_map = {}
+                    for i, mid in enumerate(mem_ids_for_chain):
+                        up = chain_results[i * 2]
+                        down = chain_results[i * 2 + 1]
+                        upstream_map[mid] = [] if isinstance(up, BaseException) else up
+                        downstream_map[mid] = [] if isinstance(down, BaseException) else down
+
                 for mid in mem_ids_for_chain:
-                    chain_coros.append(self.graph.get_causal_chain(mid, "upstream", org_ids=org_ids_for_chain))
-                    chain_coros.append(self.graph.get_causal_chain(mid, "downstream", org_ids=org_ids_for_chain))
-                chain_results = await asyncio.gather(*chain_coros, return_exceptions=True)
-                for i, mid in enumerate(mem_ids_for_chain):
-                    upstream = chain_results[i * 2]
-                    downstream = chain_results[i * 2 + 1]
-                    if isinstance(upstream, BaseException):
-                        upstream = []
-                    if isinstance(downstream, BaseException):
-                        downstream = []
+                    upstream = upstream_map.get(mid, [])
+                    downstream = downstream_map.get(mid, [])
                     mem = next(m for m in memories if m.get("id") == mid)
                     causal_basis = []
                     causal_chain = []
                     seen_causal: set[str] = set()
-                    for n in upstream[:5]:
+                    for n in upstream[:10]:
                         nid_str = str(n.id)
                         if nid_str not in seen_causal:
                             causal_basis.append({"id": nid_str, "summary": n.content_summary, "direction": "upstream"})
                             seen_causal.add(nid_str)
-                    for n in downstream[:5]:
+                    for n in downstream[:10]:
                         nid_str = str(n.id)
                         if nid_str not in seen_causal:
                             causal_basis.append({"id": nid_str, "summary": n.content_summary, "direction": "downstream"})
                             seen_causal.add(nid_str)
                     if upstream:
-                        for n in reversed(upstream[:5]):
+                        for n in reversed(upstream[:10]):
                             causal_chain.append({"id": str(n.id), "summary": n.content_summary})
                         origin = node_by_id.get(mid)
                         if origin:

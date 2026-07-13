@@ -8,12 +8,14 @@
 
 **The intelligence layer for AI memory.**
 
-> Scoring engine + causal graph + lifecycle manager for AI agent memory. Speaks MCP natively.
+> Genesys doesn't just remember what happened; it remembers why. A scoring engine + causal graph + lifecycle manager for AI agent memory. Speaks MCP natively.
 <img width="1512" height="827" alt="image" src="https://github.com/user-attachments/assets/d152aa07-a852-4b8e-9f98-942d0bebd497" />
 
 ## What is this
 
-Genesys is a scoring engine, causal graph, and lifecycle manager for AI memory. Memories are scored by a multiplicative formula (relevance × connectivity × reactivation), connected in a causal graph, and actively forgotten when they become irrelevant. It plugs into any storage backend and speaks MCP natively.
+Genesys is a scoring engine, causal graph, and lifecycle manager for AI memory. Memories are scored by a multiplicative formula (relevance × connectivity × reactivation), connected in a causal graph, and actively forgotten when they become irrelevant.
+
+This package (`genesys-memory`) is the core library: an in-memory causal graph engine with optional JSON persistence, plus a stdio MCP server. It has no database dependency and no REST API. A hosted product built on top of this library — with Postgres, additional storage backends, and a REST/HTTP MCP API — is available separately at `genesys-api.astrixlabs.ai`; it is not part of this package.
 
 ## Why
 
@@ -25,152 +27,25 @@ Your AI remembers everything but understands nothing. Genesys fixes that.
 
 ## Quick Start
 
-> **Most people should start with Option 1 (in-memory).** If you want fully local with no API keys, jump to [Option 3: Obsidian + local](#fully-local-no-api-keys).
-
-### Option 1: In-Memory (zero dependencies)
-
-The fastest way to try Genesys. No database required — state is kept in memory and optionally persisted to a JSON file.
+Install the package. The base install has zero database dependencies — state lives in memory and is optionally persisted to a JSON file.
 
 ```bash
 pip install genesys-memory
-cp .env.example .env
-# Set OPENAI_API_KEY in .env
-
-uvicorn genesys.api:app --port 8000
 ```
 
-To persist across restarts, set `GENESYS_PERSIST_PATH` in `.env`:
-
-```env
-GENESYS_PERSIST_PATH=.genesys_state.json
-```
-
-> **Give this to Claude to set it up for you:**
-> *"Install genesys-memory, create a .env with my OpenAI key, start the server on port 8000 with the in-memory backend, and connect it as an MCP server."*
-
-### Option 2: Postgres + pgvector (production)
-
-Persistent, scalable storage with vector search via pgvector.
+Optional extras:
 
 ```bash
-pip install 'genesys-memory[postgres]'
-cp .env.example .env
+pip install 'genesys-memory[openai]'      # OpenAI embeddings
+pip install 'genesys-memory[local]'       # Local embeddings (sentence-transformers, no API key)
+pip install 'genesys-memory[anthropic]'   # LLM-based causal inference (consolidation, contradiction detection)
 ```
 
-Edit `.env`:
-
-```env
-OPENAI_API_KEY=sk-...
-GENESYS_BACKEND=postgres
-DATABASE_URL=postgresql://genesys:genesys@localhost:5432/genesys
-```
-
-Start Postgres and run migrations:
+Run the stdio MCP server directly:
 
 ```bash
-docker compose up -d postgres
-alembic upgrade head
-GENESYS_BACKEND=postgres uvicorn genesys.api:app --port 8000
+python3 -m genesys_memory
 ```
-
-> **Give this to Claude to set it up for you:**
-> *"Install genesys-memory[postgres], start a Postgres container with pgvector using docker compose, run alembic migrations, create a .env with my OpenAI key and DATABASE_URL, start the server with GENESYS_BACKEND=postgres, and connect it as an MCP server."*
-
-### Option 3: Obsidian Vault (local-first)
-
-Turns your Obsidian vault into a Genesys memory store. Markdown files become memory nodes, `[[wikilinks]]` become causal edges. A SQLite sidecar (`.genesys/index.db`) handles indexing.
-
-```bash
-pip install 'genesys-memory[obsidian]'
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-OPENAI_API_KEY=sk-...
-GENESYS_BACKEND=obsidian
-OBSIDIAN_VAULT_PATH=/path/to/your/vault
-```
-
-Start the server:
-
-```bash
-uvicorn genesys.api:app --port 8000
-```
-
-On first start, Genesys indexes all `.md` files in the vault and generates embeddings. A file watcher re-indexes incrementally when you edit notes.
-
-> If `OBSIDIAN_VAULT_PATH` is not set, Genesys auto-detects by looking for `.obsidian/` in `~/Documents/personal`, `~/Documents/Obsidian`, and `~/obsidian`.
-
-#### Fully local (no API keys)
-
-Use the local embedding provider to run Obsidian mode with zero external dependencies:
-
-```bash
-pip install 'genesys-memory[obsidian,local]'
-```
-
-```env
-GENESYS_BACKEND=obsidian
-GENESYS_EMBEDDER=local
-OBSIDIAN_VAULT_PATH=/path/to/your/vault
-# No OPENAI_API_KEY needed
-```
-
-```bash
-uvicorn genesys.api:app --port 8000
-```
-
-This uses `all-MiniLM-L6-v2` (384-dim) via `sentence-transformers` for embeddings. The model is downloaded on first use (~80 MB).
-
-Connect Claude Desktop — add to your `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "genesys": {
-      "url": "http://localhost:8000/mcp"
-    }
-  }
-}
-```
-
-Or for Claude Code:
-
-```bash
-claude mcp add --transport http genesys http://localhost:8000/mcp
-```
-
-> **Give this to Claude to set it up for you:**
-> *"Install genesys-memory[obsidian,local], create a .env with GENESYS_BACKEND=obsidian, GENESYS_EMBEDDER=local, and OBSIDIAN_VAULT_PATH to my vault at [YOUR_VAULT_PATH], start the server on port 8000, and connect it as an MCP server. No API keys needed."*
-
-### Option 4: FalkorDB (graph-native)
-
-Uses FalkorDB (Redis-based graph database) for native graph traversal.
-
-```bash
-pip install 'genesys-memory[falkordb]'
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-OPENAI_API_KEY=sk-...
-GENESYS_BACKEND=falkordb
-FALKORDB_HOST=localhost
-```
-
-Start FalkorDB and the server:
-
-```bash
-docker compose up -d falkordb
-uvicorn genesys.api:app --port 8000
-```
-
-> **Give this to Claude to set it up for you:**
-> *"Install genesys-memory[falkordb], start a FalkorDB container using docker compose, create a .env with my OpenAI key and GENESYS_BACKEND=falkordb, start the server on port 8000, and connect it as an MCP server."*
 
 ### From source
 
@@ -178,28 +53,15 @@ uvicorn genesys.api:app --port 8000
 git clone https://github.com/rishimeka/genesys.git
 cd genesys
 pip install -e '.[dev]'
+pytest tests/
 ```
-
-### Seed scripts
-
-Two utility scripts populate a running Genesys instance with demo data via the REST API. They require a running server with Clerk auth configured.
-
-```bash
-cp .env.example .env
-# Set CLERK_SECRET_KEY and CLERK_USER_ID in .env
-
-python seed_demo.py      # Creates 25 memories with causal edges and runs recall queries
-python seed_recalls.py   # Runs 5 rounds of recall queries to build reactivation history
-```
-
-Both scripts read credentials from environment variables (via `.env`). See `.env.example` for all required variables.
 
 ## Connect to your AI
 
 ### Claude Code
 
 ```bash
-claude mcp add --transport http genesys http://localhost:8000/mcp
+claude mcp add genesys -- python -m genesys_memory
 ```
 
 ### Claude Desktop
@@ -210,18 +72,11 @@ Add to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "genesys": {
-      "url": "http://localhost:8000/mcp"
+      "command": "python",
+      "args": ["-m", "genesys_memory"]
     }
   }
 }
-```
-
-### Any MCP client
-
-Point your client at the MCP endpoint:
-
-```
-http://localhost:8000/mcp
 ```
 
 ## MCP Tools
@@ -265,29 +120,15 @@ Memories can also be promoted to **core** status — structurally important memo
 
 ## Benchmark Results
 
-Tested on the [LoCoMo](https://arxiv.org/abs/2402.06397) long-conversation memory benchmark (1,540 questions across 10 conversations, category 5 excluded — adversarial questions where the ground truth contains factual errors, e.g. incorrect dates and event attributions):
+We've run internal evaluations against the [LoCoMo](https://arxiv.org/abs/2402.06397) long-conversation memory benchmark during development. These are self-reported, run with our own harness (category 5 — adversarial questions with disputed ground truth — excluded), and not independently reproduced, so treat them as directional rather than a verified claim. Reproduction scripts are in [`benchmarks/`](benchmarks/) if you want to run your own numbers.
 
-| Category | J-Score |
-|----------|---------|
-| Single-hop | 94.3% |
-| Temporal | 87.5% |
-| Multi-hop | 69.8% |
-| Open-domain | 91.7% |
-| **Overall** | **89.9%** |
+## Storage backend
 
-Answer model: `gpt-4o-mini` | Judge model: `gpt-4o-mini` | Retrieval k=20
+This package ships one storage backend: an in-memory causal graph (`storage/memory.py`) with optional JSON persistence via `GENESYS_PERSIST_PATH`. No database is required.
 
-For context, Mem0 scored 67.1% and Zep scored 75.1% on the same benchmark. Full reproduction scripts are in [`benchmarks/`](benchmarks/).
+Additional backends — Postgres/pgvector, FalkorDB, MongoDB, and an Obsidian vault adapter — along with a REST API, OAuth, and multi-user auth, are part of the hosted product at `genesys-api.astrixlabs.ai` and are not included in this repo.
 
-## Storage backends
-
-| Backend | Install | Use case |
-|---------|---------|----------|
-| `memory` | Built-in | Zero deps, try it out |
-| `postgres` + pgvector | `pip install 'genesys-memory[postgres]'` | Persistent, scalable |
-| Obsidian vault | `pip install 'genesys-memory[obsidian]'` | Local-first knowledge base |
-| FalkorDB | `pip install 'genesys-memory[falkordb]'` | Graph-native traversal |
-| Custom | Bring your own | Implement `GraphStorageProvider` |
+Want a different storage backend for the open-source library? Implement the provider protocols in [`storage/base.py`](src/genesys_memory/storage/base.py) and bring your own.
 
 ## Configuration
 
@@ -296,12 +137,9 @@ Copy `.env.example` to `.env` and set:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `OPENAI_API_KEY` | Unless `GENESYS_EMBEDDER=local` | Embeddings |
-| `ANTHROPIC_API_KEY` | No | LLM memory processing (consolidation, contradiction detection) |
-| `GENESYS_BACKEND` | No | `memory` (default), `postgres`, `obsidian`, or `falkordb` |
+| `ANTHROPIC_API_KEY` | No | Enables LLM-based causal inference (consolidation, contradiction detection). Off by default — without it, causal edges only come from edges the caller explicitly declares in `memory_store` plus cosine-similarity linking. |
 | `GENESYS_EMBEDDER` | No | `openai` (default) or `local` (sentence-transformers, no API key) |
-| `DATABASE_URL` | If postgres | Postgres connection string |
-| `OBSIDIAN_VAULT_PATH` | If obsidian | Path to your Obsidian vault |
-| `FALKORDB_HOST` | If falkordb | FalkorDB host (default: `localhost`) |
+| `GENESYS_PERSIST_PATH` | No | JSON file path to persist state across restarts (in-memory otherwise) |
 | `GENESYS_USER_ID` | No | Default user ID for single-tenant mode |
 
 See [`.env.example`](.env.example) for all options.
