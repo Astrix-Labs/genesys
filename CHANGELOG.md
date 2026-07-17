@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.1] - 2026-07-17
 
 ### Fixed (0.4.0 field-retest round 2)
 
