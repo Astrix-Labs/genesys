@@ -244,6 +244,7 @@ class TestExplainShowsStaleness:
         graph.is_orphan = AsyncMock(return_value=False)
         graph.get_causal_chain = AsyncMock(return_value=[])
         graph.get_edges = AsyncMock(return_value=[stale_edge, fresh_edge])
+        graph.get_stats = AsyncMock(return_value={"max_causal_weight": 5})
 
         result = await handler.memory_explain(str(node.id))
 

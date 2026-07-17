@@ -49,6 +49,57 @@ def _is_edge_stale(edge: MemoryEdge) -> bool:
     return days > config.EDGE_STALE_DAYS
 
 
+def _parse_iso_utc(value: str) -> datetime:
+    """Parse an ISO 8601 string, assuming UTC when no timezone is given.
+
+    Node timestamps are always tz-aware, and comparing a tz-aware datetime
+    against a naive one raises TypeError — so every ISO timestamp accepted
+    from a tool argument must go through this normalization.
+    """
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _truncate_summary(content: str, limit: int = 200) -> str:
+    """Truncate content to a word boundary. This is truncation, not an LLM summary.
+
+    Returns short content verbatim; otherwise cuts at the last whole word that
+    fits within ``limit`` (including the trailing ellipsis) so words are never
+    split mid-token.
+    """
+    if len(content) <= limit:
+        return content
+    cut = content[: limit - 1]
+    if " " in cut:
+        cut = cut[: cut.rfind(" ")]
+    return cut + "…"
+
+
+def _live_connectivity_factor(causal_weight: int, max_causal_weight: int, is_orphan: bool) -> float:
+    """Force-2 (connectivity) computed live for legibility.
+
+    Mirrors the Force-2 block of ``scoring.calculate_decay_score`` exactly — the
+    scoring math is not changed here, only surfaced so callers can read the live
+    contribution instead of the stored (possibly stale) ``decay_score``.
+    """
+    import math
+
+    from genesys_memory.engine import config
+
+    if max_causal_weight > 0:
+        raw = math.log2(1 + causal_weight) / math.log2(1 + max_causal_weight)
+        cf = raw ** 2
+    else:
+        cf = 0.0
+    if is_orphan:
+        return 0.0
+    if cf < config.MIN_CONNECTIVITY:
+        cf = config.MIN_CONNECTIVITY
+    return cf
+
+
 class MCPToolHandler:
     def __init__(
         self,
@@ -86,13 +137,35 @@ class MCPToolHandler:
         created_at: str | None = None,
         visibility: str = "private",
         org_id: str | None = None,
+        related: list[dict[str, str]] | None = None,
+        category: str | None = None,
     ) -> dict[str, Any]:
         """Store a new memory. Returns the node ID.
 
+        Parameter order note: this is a published API — new parameters are
+        appended AFTER the original positional tail (``created_at``,
+        ``visibility``, ``org_id``) so existing positional callers keep
+        working. Never insert parameters mid-signature.
+
         Args:
+            related_to: Legacy; creates caused_by edges — prefer ``related`` for
+                typed edges. Each entry is the id of an existing node.
+            related: Typed explicit edges, each ``{"id": <node-id>, "type":
+                <edge-type>}``. Direction convention is source = the new node,
+                i.e. ``new_node --type--> target`` reads "new node <type>
+                target" (e.g. ``supersedes`` → the new node supersedes the
+                target). Invalid types are rejected before the node is created.
+            category: Free-form classification string. Suggested vocabulary is
+                the auto-promote categories (professional, educational, family,
+                location) since those interact with core promotion, but any
+                string is accepted.
             created_at: Optional ISO 8601 timestamp. Defaults to now.
             visibility: "private" or "org". Defaults to "private".
             org_id: Required when visibility is "org".
+
+        The result may include ``possible_conflicts`` — heuristic hints (lexical
+        numeric/negation divergence against auto-link candidates), not verified
+        contradictions, and never materialized as edges.
         """
         vis = Visibility(visibility)
         if vis == Visibility.ORG and not org_id:
@@ -100,12 +173,25 @@ class MCPToolHandler:
         if vis == Visibility.ORG and org_id not in current_org_ids.get([]):
             return {"error": "org_id not in caller's org memberships"}
 
-        embedding = await self.embeddings.embed(content) if self.embeddings else []
-        summary = content[:200]
+        # Validate typed relations up front — explicit writes must not
+        # half-succeed (fail fast before the node is ever created).
+        parsed_related: list[tuple[str, EdgeType]] = []
+        if related:
+            for item in related:
+                raw_type = item.get("type")
+                try:
+                    etype = EdgeType(raw_type)
+                except (ValueError, KeyError):
+                    return {
+                        "error": f"invalid edge type: {raw_type}",
+                        "valid_types": [e.value for e in EdgeType],
+                    }
+                parsed_related.append((item["id"], etype))
 
-        ts = datetime.fromisoformat(created_at) if created_at else datetime.now(timezone.utc)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+        embedding = await self.embeddings.embed(content) if self.embeddings else []
+        summary = _truncate_summary(content)
+
+        ts = _parse_iso_utc(created_at) if created_at else datetime.now(timezone.utc)
         node = MemoryNode(
             status=MemoryStatus.ACTIVE,
             content_summary=summary,
@@ -118,6 +204,7 @@ class MCPToolHandler:
             causal_weight=0,
             source_agent="claude",
             source_session=source_session,
+            category=category,
             visibility=vis,
             org_id=org_id,
             original_user_id=_caller_uid(),
@@ -125,7 +212,7 @@ class MCPToolHandler:
 
         node_id = await self.graph.create_node(node)
 
-        # Explicit edges from related_to (with visibility check)
+        # Explicit edges from related_to (legacy caused_by, with visibility check)
         if related_to:
             for target_id in related_to:
                 target_node = await self.graph.get_node(target_id)
@@ -144,37 +231,111 @@ class MCPToolHandler:
                 )
                 await self.graph.create_edge(edge)
 
+        # Typed explicit edges from `related` (writer-specified semantics)
+        if parsed_related:
+            for target_id, etype in parsed_related:
+                target_node = await self.graph.get_node(target_id)
+                if target_node is None:
+                    logger.warning(
+                        "related target %s not visible to caller %s; skipping edge",
+                        target_id, _caller_uid(),
+                    )
+                    continue
+                edge = MemoryEdge(
+                    source_id=node.id,
+                    target_id=uuid.UUID(target_id),
+                    type=etype,
+                    weight=0.7,
+                    created_by="user_explicit",
+                )
+                await self.graph.create_edge(edge)
+
         # Auto-link to semantically similar existing memories
+        possible_conflicts: list[dict[str, Any]] = []
         if embedding:
             try:
+                from genesys_memory.engine import config
+                from genesys_memory.engine.contradiction import heuristic_conflict_signal
+
                 org_ids = current_org_ids.get([])
-                similar = await self.graph.vector_search(embedding, k=4, org_ids=org_ids)
+                min_sim = config.resolve_autolink_min_similarity(self.embeddings)
+                # The conflict-hint scan uses its OWN (lower) floor: a changed
+                # figure between two versions of a fact often lands below the
+                # strict "clearly the same topic" auto-link band, so gating the
+                # scan on the auto-link floor would silently shrink conflict
+                # detection every time that floor is raised.
+                conflict_min_sim = config.resolve_conflict_min_similarity(self.embeddings)
+                # F6 dedupe: fetch this node's existing neighbors once. ANY edge
+                # (any type, either direction) suppresses a duplicate auto-link,
+                # so a user_explicit caused_by/supersedes never gets shadowed by
+                # a parallel auto_link related_to.
+                existing = await self.graph.get_edges(node_id, "both")
+                linked_ids = {
+                    str(e.target_id) if str(e.source_id) == node_id else str(e.source_id)
+                    for e in existing
+                }
+                # +1 because the query's own top hit is usually the new node.
+                # The window is the max of the auto-link fan-out and the
+                # (wider) conflict-scan window.
+                scan_k = max(config.AUTOLINK_MAX_EDGES + 1, config.CONFLICT_SCAN_K)
+                similar = await self.graph.vector_search(
+                    embedding, k=scan_k, org_ids=org_ids
+                )
+                links_created = 0
                 with self._defer_saves():
                     for other_node, score in similar:
                         if str(other_node.id) == node_id:
                             continue
-                        if score < 0.3:
+                        if score < min_sim and score < conflict_min_sim:
                             continue
                         # Org boundary rule: org nodes only link to same-org nodes
                         if vis == Visibility.ORG:
                             if other_node.visibility != Visibility.ORG or other_node.org_id != org_id:
                                 continue
-                        already = await self.graph.edge_exists(node_id, str(other_node.id), EdgeType.RELATED_TO)
-                        if not already:
-                            edge = MemoryEdge(
-                                source_id=node.id,
-                                target_id=other_node.id,
-                                type=EdgeType.RELATED_TO,
-                                weight=round(score, 4),
-                                reason=f"cosine similarity {score:.3f}",
-                                created_by="auto_link",
+                        # Heuristic conflict hint — never creates structure.
+                        if score >= conflict_min_sim:
+                            signal = heuristic_conflict_signal(
+                                content, other_node.content_full or other_node.content_summary
                             )
-                            await self.graph.create_edge(edge)
+                            if signal:
+                                possible_conflicts.append({
+                                    "id": str(other_node.id),
+                                    "summary": other_node.content_summary,
+                                    "signal": signal,
+                                })
+                        if score < min_sim:
+                            continue
+                        # F6: skip if this pair is already linked by any edge.
+                        if str(other_node.id) in linked_ids:
+                            continue
+                        if links_created >= config.AUTOLINK_MAX_EDGES:
+                            # Fan-out cap reached; keep scanning for conflicts only.
+                            continue
+                        # F2 incoming-degree cap: fan-out alone doesn't stop a
+                        # hub from *accreting* one link per store forever, so
+                        # also bound the target's accumulated auto-link degree.
+                        target_edges = await self.graph.get_edges(str(other_node.id), "both")
+                        target_auto_degree = sum(
+                            1 for e in target_edges if e.created_by == "auto_link"
+                        )
+                        if target_auto_degree >= config.AUTOLINK_MAX_NODE_DEGREE:
+                            continue
+                        edge = MemoryEdge(
+                            source_id=node.id,
+                            target_id=other_node.id,
+                            type=EdgeType.RELATED_TO,
+                            weight=round(score, 4),
+                            reason=f"cosine similarity {score:.3f}",
+                            created_by="auto_link",
+                        )
+                        await self.graph.create_edge(edge)
+                        linked_ids.add(str(other_node.id))
+                        links_created += 1
             except Exception:
                 logger.warning("Auto-linking failed for node %s", node_id, exc_info=True)
 
         # Promote tagged → active if edges were formed (consolidation signal)
-        has_edges = related_to or not await self.graph.is_orphan(node_id)
+        has_edges = related_to or parsed_related or not await self.graph.is_orphan(node_id)
         if has_edges:
             await self.graph.update_node(node_id, {"status": MemoryStatus.ACTIVE})
 
@@ -185,7 +346,58 @@ class MCPToolHandler:
             })
 
         await self._notify("memory.created", {"node_id": node_id, "content": content[:200]})
-        return {"node_id": node_id, "status": "stored", "visibility": vis.value}
+        result: dict[str, Any] = {"node_id": node_id, "status": "stored", "visibility": vis.value}
+        if possible_conflicts:
+            result["possible_conflicts"] = possible_conflicts
+        return result
+
+    async def memory_amend(
+        self, node_id: str, content: str, reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a correction: create a new memory that supersedes an old one.
+
+        The old memory is kept (its status is unchanged — recall already decays
+        superseded hits by SUPERSEDED_DECAY and tags them ``superseded_by``, and
+        the transitions engine demotes it naturally as it stops being recalled).
+        Mutating status here would bypass that engine and be non-reversible.
+        """
+        old = await self.graph.get_node(node_id)
+        if not old:
+            return {"error": "Node not found", "node_id": node_id}
+        if not _caller_owns_node(old):
+            return {"error": "Only the node owner can amend this memory"}
+
+        # Reuse the store hot path so the new node gets embedding + auto-link +
+        # eventing. Passing `related` also lets F6 dedupe suppress any parallel
+        # auto_link edge back to the old node.
+        store_result = await self.memory_store(
+            content,
+            source_session=old.source_session,
+            category=old.category,
+            related=[{"id": node_id, "type": EdgeType.SUPERSEDES.value}],
+            visibility=old.visibility.value,
+            org_id=old.org_id,
+        )
+        if "error" in store_result:
+            return store_result
+        new_id = store_result["node_id"]
+
+        # Upgrade the supersedes edge to a full-strength, reasoned correction.
+        # No field-level edge mutator exists on the Protocol, so recreate it.
+        for e in await self.graph.get_edges(new_id, "out", EdgeType.SUPERSEDES):
+            if str(e.target_id) == node_id:
+                await self.graph.delete_edge(str(e.id))
+        await self.graph.create_edge(MemoryEdge(
+            source_id=uuid.UUID(new_id),
+            target_id=uuid.UUID(node_id),
+            type=EdgeType.SUPERSEDES,
+            weight=1.0,
+            reason=reason or "amended",
+            created_by="user_explicit",
+        ))
+
+        await self._notify("memory.amended", {"node_id": new_id, "supersedes": node_id})
+        return {"node_id": new_id, "supersedes": node_id, "status": "amended"}
 
     async def memory_recall(
         self,
@@ -193,9 +405,21 @@ class MCPToolHandler:
         k: int = 10,
         max_results: int | None = None,
         read_only: bool = False,
+        verbosity: str = "full",
     ) -> dict[str, Any]:
-        """Recall memories by hybrid search: vector + keyword, ranked by vector similarity."""
+        """Recall memories by hybrid search: vector + keyword, ranked by vector similarity.
+
+        verbosity: "full" (default; unchanged payload) or "concise". Concise
+        hits carry only id/summary/status/score/activation/is_core (plus
+        superseded_by when set); the expensive causal-chain queries are skipped
+        entirely. Reactivation writes still happen in both modes (governed by
+        read_only, not verbosity).
+        """
         import asyncio
+
+        if verbosity not in ("full", "concise"):
+            logger.warning("memory_recall verbosity=%r unrecognized; using 'full'", verbosity)
+            verbosity = "full"
 
         MAX_K = 100
         if k > MAX_K:
@@ -359,10 +583,11 @@ class MCPToolHandler:
         cap = max_results if max_results is not None else k
         memories = memories[:cap]
 
-        # Enrich top results with causal chains (batch fetch)
+        # Enrich top results with causal chains (batch fetch). Skipped entirely
+        # in concise mode — the chain queries are the main latency cost.
         org_ids_for_chain = current_org_ids.get([])
         mem_ids_for_chain = [m["id"] for m in memories if m.get("id")]
-        if mem_ids_for_chain:
+        if verbosity != "concise" and mem_ids_for_chain:
             try:
                 has_batch = hasattr(self.graph, "get_causal_chains_batch")
                 if has_batch:
@@ -450,6 +675,22 @@ class MCPToolHandler:
                     except Exception:
                         logger.warning("Co-retrieval edge validation failed", exc_info=True)
 
+        if verbosity == "concise":
+            concise: list[dict[str, Any]] = []
+            for mem in memories:
+                c: dict[str, Any] = {
+                    "id": mem.get("id"),
+                    "summary": mem.get("summary"),
+                    "status": mem.get("status"),
+                    "score": mem.get("score"),
+                    "activation": mem.get("activation"),
+                    "is_core": mem.get("is_core", False),
+                }
+                if "superseded_by" in mem:
+                    c["superseded_by"] = mem["superseded_by"]
+                concise.append(c)
+            return {"query": query, "results": concise, "count": len(concise)}
+
         return {"query": query, "results": memories, "count": len(memories)}
 
     def _format_memory_light(self, node: MemoryNode, score: float) -> dict[str, Any]:
@@ -460,6 +701,10 @@ class MCPToolHandler:
             "summary": node.content_summary,
             "status": node.status.value,
             "decay_score": round(node.decay_score, 4),
+            # `activation` is an alias for `decay_score`: same value, clearer
+            # name. The score is an activation/retention weight (retrieval
+            # RAISES it), not a countdown to deletion.
+            "activation": round(node.decay_score, 4),
             "score": round(score, 4),
             "created_at": node.created_at.isoformat(),
             "causal_basis": [],
@@ -494,46 +739,89 @@ class MCPToolHandler:
             logger.warning("Causal chain formatting failed for node %s", node.id, exc_info=True)
         return result
 
+    @staticmethod
+    def _node_passes_filters(node: MemoryNode, filters: dict[str, Any] | None) -> bool:
+        """Apply memory_search's post-query filters to a node.
+
+        ISO timestamps are normalized to UTC when tz-naive (matching
+        memory_store's created_at handling) — node timestamps are always
+        tz-aware, so comparing against a naive datetime would raise TypeError.
+        """
+        if not filters:
+            return True
+        if "category" in filters and node.category != filters["category"]:
+            return False
+        if "entity" in filters and filters["entity"] not in node.entity_refs:
+            return False
+        if "since" in filters:
+            since_dt = _parse_iso_utc(filters["since"])
+            if node.created_at < since_dt:
+                return False
+        if "active_since" in filters:
+            active_dt = _parse_iso_utc(filters["active_since"])
+            if node.last_reactivated_at < active_dt:
+                return False
+        return True
+
+    @staticmethod
+    def _format_search_hit(node: MemoryNode, score: float) -> dict[str, Any]:
+        return {
+            "id": str(node.id),
+            "summary": node.content_summary,
+            "status": node.status.value,
+            "decay_score": round(node.decay_score, 4),
+            "score": round(score, 4),
+            "category": node.category,
+            "created_at": node.created_at.isoformat(),
+            # Provenance / recency fields (additive) so "what changed" answers
+            # carry where and when a memory last moved.
+            "last_reactivated_at": node.last_reactivated_at.isoformat(),
+            "source_session": node.source_session,
+        }
+
     async def memory_search(
         self,
         query: str,
         filters: dict[str, Any] | None = None,
         k: int = 10,
     ) -> dict[str, Any]:
-        """Filtered vector search by status/category/date/entity."""
-        if not self.embeddings:
-            return {"query": query, "results": [], "count": 0}
-        embedding = await self.embeddings.embed(query)
+        """Filtered vector search by status/category/date/entity.
 
-        # Determine status filter
+        Enumeration mode (F8): an EMPTY ``query`` skips vector search entirely
+        and lists memories by recency (``last_reactivated_at`` descending),
+        honoring the same filters. Combined with ``since``/``active_since``
+        this answers "what's new/changed since <ts>" without knowing what to
+        query for, and works with no embedder configured.
+        """
+        # Determine status filter (shared by both modes)
         status_filter = None
         if filters and "status" in filters:
             status_filter = [MemoryStatus(s) for s in filters["status"]]
+
+        if not query.strip():
+            # Non-vector enumeration path.
+            statuses = status_filter if status_filter is not None else list(MemoryStatus)
+            nodes_by_id: dict[str, MemoryNode] = {}
+            for status in statuses:
+                for node in await self.graph.get_nodes_by_status(status, limit=1000):
+                    nodes_by_id[str(node.id)] = node
+            filtered = [n for n in nodes_by_id.values() if self._node_passes_filters(n, filters)]
+            filtered.sort(key=lambda n: n.last_reactivated_at, reverse=True)
+            memories = [self._format_search_hit(n, 0.0) for n in filtered[:k]]
+            return {"query": query, "results": memories, "count": len(memories)}
+
+        if not self.embeddings:
+            return {"query": query, "results": [], "count": 0}
+        embedding = await self.embeddings.embed(query)
 
         results = await self.graph.vector_search(embedding, k=k, status_filter=status_filter)
 
         # Apply additional filters post-query
         memories = []
         for node, score in results:
-            if filters:
-                if "category" in filters and node.category != filters["category"]:
-                    continue
-                if "entity" in filters and filters["entity"] not in node.entity_refs:
-                    continue
-                if "since" in filters:
-                    since_dt = datetime.fromisoformat(filters["since"])
-                    if node.created_at < since_dt:
-                        continue
-
-            memories.append({
-                "id": str(node.id),
-                "summary": node.content_summary,
-                "status": node.status.value,
-                "decay_score": round(node.decay_score, 4),
-                "score": round(score, 4),
-                "category": node.category,
-                "created_at": node.created_at.isoformat(),
-            })
+            if not self._node_passes_filters(node, filters):
+                continue
+            memories.append(self._format_search_hit(node, score))
 
         return {"query": query, "results": memories, "count": len(memories)}
 
@@ -563,7 +851,40 @@ class MCPToolHandler:
             for n in nodes
         ]
 
-        return {"start_node": node_id, "depth": depth, "nodes": result_nodes, "count": len(result_nodes)}
+        # Edges of the induced subgraph among the returned nodes (a deliberate
+        # superset of the BFS tree, so callers can render/reconstruct paths).
+        # Induced-subgraph + edge-type + visibility filtering all live in the
+        # storage layer, so no tool-side re-filtering is needed.
+        #
+        # get_connecting_edges is a NEW Protocol method — Protocols are
+        # structural, not enforced, so external providers (genesys-server's
+        # postgres/falkordb/mongo/obsidian backends) may not implement it yet.
+        # Same precedent as the get_causal_chains_batch guard in memory_recall:
+        # degrade to an empty edge list instead of raising AttributeError and
+        # breaking one of the original 11 tools on upgrade.
+        node_ids = [str(n.id) for n in nodes]
+        result_edges: list[dict[str, Any]] = []
+        if hasattr(self.graph, "get_connecting_edges"):
+            edges = await self.graph.get_connecting_edges(node_ids, parsed_types, org_ids=org_ids)
+            result_edges = [
+                {
+                    "source": str(e.source_id),
+                    "target": str(e.target_id),
+                    "type": e.type.value,
+                    "weight": round(e.weight, 4),
+                    "created_by": e.created_by,
+                }
+                for e in edges
+            ]
+
+        return {
+            "start_node": node_id,
+            "depth": depth,
+            "nodes": result_nodes,
+            "count": len(result_nodes),
+            "edges": result_edges,
+            "edge_count": len(result_edges),
+        }
 
     async def memory_explain(self, node_id: str) -> dict[str, Any]:
         """Score breakdown, causal basis, and removal impact for a memory."""
@@ -586,11 +907,48 @@ class MCPToolHandler:
         else:
             removal_impact = "Low impact — no downstream dependents"
 
+        # Compute Force-2 (connectivity) and Force-3 (activation) LIVE from this
+        # node's current edges/reactivation history, so the reader sees fresh
+        # contributions rather than the stored (possibly stale) decay_score.
+        import math
+
+        from genesys_memory.engine import config
+        from genesys_memory.engine.scoring import base_level_activation
+
+        stats = await self.graph.get_stats()
+        max_causal_weight = int(stats.get("max_causal_weight", 0) or 0)
+        connectivity_factor_live = _live_connectivity_factor(
+            causal_weight, max_causal_weight, is_orphan
+        )
+        b_i = base_level_activation(node.reactivation_timestamps, node.created_at)
+        activation_factor_live = min(max(math.exp(b_i), 0.0), 1.0)
+
         return {
             "node_id": node_id,
             "summary": node.content_summary,
             "status": node.status.value,
             "decay_score": round(node.decay_score, 4),
+            "activation": round(node.decay_score, 4),
+            "score_model": {
+                "formula": "decay_score = relevance x connectivity_factor x activation_factor",
+                "reading": (
+                    "Higher = more strongly retained. This is an activation/retention "
+                    "score, not a countdown: retrieval RAISES it. A memory is prune-"
+                    "eligible only when it falls below "
+                    f"{config.FORGETTING_THRESHOLD} AND is orphaned AND not pinned."
+                ),
+                "forces": {
+                    "relevance": "query-dependent; contributes at recall time, not at rest",
+                    "connectivity_factor": round(connectivity_factor_live, 4),
+                    "activation_factor": round(activation_factor_live, 4),
+                },
+                "staleness_note": (
+                    "stored decay_score is recomputed by evaluate_transitions "
+                    "(background worker in hosted deployments); live forces above "
+                    "are computed fresh from this node's current edges and "
+                    "reactivation history"
+                ),
+            },
             "stability": round(node.stability, 4),
             "causal_weight": causal_weight,
             "reactivation_count": node.reactivation_count,

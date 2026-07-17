@@ -139,6 +139,75 @@ def resolve_core_inject_min_similarity(embeddings: object | None) -> float:
     return recommended if recommended is not None else CORE_INJECT_MIN_SIMILARITY_OTHER_DEFAULT
 
 # ---------------------------------------------------------------------------
+# Auto-linking (tools.py — memory_store)
+# ---------------------------------------------------------------------------
+# An auto-link creates *permanent* graph structure, so its similarity floor
+# should sit ABOVE the transient recall floor: link only when two memories are
+# clearly the same topic, not merely mutually retrievable. Like the recall
+# floors above, the genuine-match band is embedder-dependent — OpenAI's
+# text-embedding-3-small genuine matches sit ~0.5+ (recall floor 0.5), so 0.6
+# means "clearly the same topic". Local MiniLM (and unknown embedders) cluster
+# lower AND noisier: field reports show noise pairs at ~0.44, i.e. ABOVE the
+# local genuine-match band top (~0.4), so the non-OpenAI floor sits above both
+# (0.45) — under local embeddings an auto-link only forms on near-duplicate
+# content, which is the conservative right answer for permanent structure.
+# These are the fallback defaults consulted by
+# resolve_autolink_min_similarity() below; an explicit
+# GENESYS_AUTOLINK_MIN_SIMILARITY env var always wins over embedder-based
+# defaults.
+#
+# Two structural caps bound the "hairball": AUTOLINK_MAX_EDGES caps fan-out
+# (how many auto-links a single memory_store may create), and
+# AUTOLINK_MAX_NODE_DEGREE caps *accumulation* (how many auto_link edges any
+# single node may accrete as the target of later stores) — fan-out alone
+# still lets a hub gain one edge per store forever.
+AUTOLINK_MIN_SIMILARITY_OPENAI_DEFAULT = 0.6
+AUTOLINK_MIN_SIMILARITY_OTHER_DEFAULT = 0.45
+AUTOLINK_MIN_SIMILARITY_OVERRIDE = _float_override("GENESYS_AUTOLINK_MIN_SIMILARITY")
+AUTOLINK_MAX_EDGES = _int("GENESYS_AUTOLINK_MAX_EDGES", "3")
+AUTOLINK_MAX_NODE_DEGREE = _int("GENESYS_AUTOLINK_MAX_NODE_DEGREE", "10")
+
+
+def resolve_autolink_min_similarity(embeddings: object | None) -> float:
+    """Effective memory_store auto-link similarity floor.
+
+    Precedence: explicit GENESYS_AUTOLINK_MIN_SIMILARITY env var > the
+    embedder's own `recommended_autolink_min_similarity` > the generic
+    non-OpenAI default (0.45).
+    """
+    if AUTOLINK_MIN_SIMILARITY_OVERRIDE is not None:
+        return AUTOLINK_MIN_SIMILARITY_OVERRIDE
+    recommended = _embedder_recommended(embeddings, "recommended_autolink_min_similarity")
+    return recommended if recommended is not None else AUTOLINK_MIN_SIMILARITY_OTHER_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# Conflict-hint scan (tools.py — memory_store possible_conflicts)
+# ---------------------------------------------------------------------------
+# The heuristic conflict scan is deliberately DECOUPLED from the auto-link
+# floor: a changed figure between two versions of a fact often sits below the
+# strict "clearly the same topic" band (the exact regime where the old 0.3
+# auto-link floor used to surface such pairs), so gating the scan on the
+# auto-link floor silently shrinks conflict detection whenever that floor is
+# raised. The scan reaches down to the recall floor by default and looks at a
+# wider vector window (CONFLICT_SCAN_K) than the auto-link fan-out.
+CONFLICT_MIN_SIMILARITY_OVERRIDE = _float_override("GENESYS_CONFLICT_MIN_SIMILARITY")
+CONFLICT_SCAN_K = _int("GENESYS_CONFLICT_SCAN_K", "8")
+
+
+def resolve_conflict_min_similarity(embeddings: object | None) -> float:
+    """Effective similarity floor for the possible_conflicts heuristic scan.
+
+    Precedence: explicit GENESYS_CONFLICT_MIN_SIMILARITY env var > the
+    embedder's own `recommended_min_similarity` (i.e. the recall floor) > the
+    generic non-OpenAI recall default (0.2).
+    """
+    if CONFLICT_MIN_SIMILARITY_OVERRIDE is not None:
+        return CONFLICT_MIN_SIMILARITY_OVERRIDE
+    recommended = _embedder_recommended(embeddings, "recommended_min_similarity")
+    return recommended if recommended is not None else RECALL_MIN_SIMILARITY_OTHER_DEFAULT
+
+# ---------------------------------------------------------------------------
 # Edge Staleness
 # ---------------------------------------------------------------------------
 EDGE_STALE_DAYS = _int("GENESYS_EDGE_STALE_DAYS", "30")

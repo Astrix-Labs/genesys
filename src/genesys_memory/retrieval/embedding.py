@@ -39,6 +39,15 @@ class LocalEmbeddingProvider:
     def recommended_core_min_similarity(self) -> float:
         return 0.2
 
+    # Auto-links create permanent graph structure. MiniLM is noisy above the
+    # genuine-match band (~0.2-0.4): field reports show noise pairs at ~0.44,
+    # so the floor sits ABOVE the band top — locally, only near-duplicate
+    # content auto-links, which is the conservative right answer for
+    # permanent structure.
+    @property
+    def recommended_autolink_min_similarity(self) -> float:
+        return 0.45
+
     async def embed(self, text: str) -> list[float]:
         self._load_model()
         vec: list[float] = self._model.encode(text, normalize_embeddings=True).tolist()
@@ -75,6 +84,12 @@ class OpenAIEmbeddingProvider:
     @property
     def recommended_core_min_similarity(self) -> float:
         return 0.45
+
+    # An auto-link creates permanent structure, so its floor sits ABOVE the
+    # transient recall floor (0.5): 0.6 means "clearly the same topic".
+    @property
+    def recommended_autolink_min_similarity(self) -> float:
+        return 0.6
 
     def _cache_key(self, text: str) -> str:
         return f"embed:{hashlib.sha256(text.encode()).hexdigest()}"

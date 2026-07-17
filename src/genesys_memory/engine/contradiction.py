@@ -1,11 +1,55 @@
 """Contradiction detection between memories."""
 from __future__ import annotations
 
+import re
 
 from genesys_memory.models.edge import MemoryEdge
 from genesys_memory.models.enums import EdgeType, MemoryStatus
 from genesys_memory.models.node import MemoryNode
 from genesys_memory.storage.base import EmbeddingProvider, GraphStorageProvider, LLMProvider
+
+_NEGATION_RE = re.compile(r"\b(not|never|no longer|n't|isn't|won't|doesn't)\b", re.IGNORECASE)
+_NUM_OR_WORD_RE = re.compile(r"[a-zA-Z]+|\d[\d,.]*%?")
+
+
+def _number_contexts(text: str) -> dict[str, set[str]]:
+    """Map each number token to its context: the nearest preceding word.
+
+    ``"budget is 50k"`` → ``{"is": {"50"}}`` (with the number token as found).
+    Numbers with no preceding word key on ``""``.
+    """
+    contexts: dict[str, set[str]] = {}
+    last_word = ""
+    for tok in _NUM_OR_WORD_RE.findall(text):
+        if tok[0].isdigit():
+            contexts.setdefault(last_word.lower(), set()).add(tok)
+        else:
+            last_word = tok
+    return contexts
+
+
+def heuristic_conflict_signal(text_a: str, text_b: str) -> str | None:
+    """Cheap, dependency-free lexical divergence check between two texts.
+
+    Returns ``"numeric_mismatch"`` when the two texts mention *differing*
+    numbers in a comparable position — i.e. some shared nearest-preceding
+    context word carries different number sets in each text ("costs 50" vs
+    "costs 75"). Numbers in unrelated positions (a date in one text, an ID in
+    the other) do NOT fire, which keeps the hint from being noise on realistic
+    workloads. Returns ``"negation"`` when exactly one text is negated;
+    otherwise ``None``. These are hints only — never verified contradictions
+    and never materialized as edges.
+    """
+    ctx_a = _number_contexts(text_a)
+    ctx_b = _number_contexts(text_b)
+    for key in ctx_a.keys() & ctx_b.keys():
+        if ctx_a[key] != ctx_b[key]:
+            return "numeric_mismatch"
+    neg_a = bool(_NEGATION_RE.search(text_a))
+    neg_b = bool(_NEGATION_RE.search(text_b))
+    if neg_a != neg_b:
+        return "negation"
+    return None
 
 
 async def detect_contradictions(

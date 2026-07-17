@@ -529,6 +529,38 @@ class InMemoryGraphProvider:
                         queue.append((next_id, d + 1))
         return result
 
+    async def get_connecting_edges(
+        self, node_ids: list[str], edge_types: list[EdgeType] | None = None, org_ids: list[str] | None = None,
+    ) -> list[MemoryEdge]:
+        """Return visible edges of the induced subgraph among ``node_ids``.
+
+        An edge is included only when BOTH of its endpoints are in ``node_ids``
+        and — when ``edge_types`` is given — its type is in that set. This is
+        the set of *connecting edges* for a traversal result: a deliberate
+        superset of the BFS tree, so callers can render/reconstruct paths.
+
+        Visibility is honored (own nodes + org-visible nodes). The induced-
+        subgraph and edge-type filtering live here (storage), not in the tool
+        layer, so every backend that implements this Protocol behaves the same.
+        """
+        id_set = set(node_ids)
+        visible_ids = set(self._visible_nodes(org_ids).keys())
+        result: list[MemoryEdge] = []
+        seen: set[str] = set()
+        for nid in id_set:
+            for e in self._visible_edges_for_node(nid, visible_ids, org_ids):
+                eid = str(e.id)
+                if eid in seen:
+                    continue
+                src, tgt = str(e.source_id), str(e.target_id)
+                if src not in id_set or tgt not in id_set:
+                    continue
+                if edge_types and e.type not in edge_types:
+                    continue
+                result.append(e)
+                seen.add(eid)
+        return result
+
     async def get_causal_chain(self, node_id: str, direction: str, org_ids: list[str] | None = None) -> list[MemoryNode]:
         visible = self._visible_nodes(org_ids)
         visible_ids = set(visible.keys())

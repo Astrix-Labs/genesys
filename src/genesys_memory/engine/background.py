@@ -50,14 +50,16 @@ async def on_memory_created(
         except Exception:
             logger.warning("Entity extraction failed for %s", node_id, exc_info=True)
 
-        # 2. Category classification
-        try:
-            category = await llm.classify_category(content)
-            if category:
-                await graph.update_node(node_id, {"category": category})
-                logger.info("Classified %s as '%s'", node_id, category)
-        except Exception:
-            logger.warning("Category classification failed for %s", node_id, exc_info=True)
+        # 2. Category classification — only fill when the caller didn't set one,
+        #    so an explicit memory_store(category=...) is never overwritten.
+        if node.category is None:
+            try:
+                category = await llm.classify_category(content)
+                if category:
+                    await graph.update_node(node_id, {"category": category})
+                    logger.info("Classified %s as '%s'", node_id, category)
+            except Exception:
+                logger.warning("Category classification failed for %s", node_id, exc_info=True)
 
         # 3. Causal edge inference
         try:
