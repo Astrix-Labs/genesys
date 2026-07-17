@@ -552,11 +552,13 @@ class MCPToolHandler:
                 for edge in all_mem_edges:
                     tgt = str(edge.target_id)
                     src = str(edge.source_id)
-                    if edge.type == EdgeType.SUPERSEDES:
-                        if tgt in node_by_id:
-                            superseded_map[tgt] = src
-                        elif src in node_by_id:
-                            superseded_map[src] = tgt
+                    # A SUPERSEDES edge is directed new(source) -> old(target):
+                    # only the TARGET is superseded. (A previous elif here
+                    # marked the superseder itself as superseded whenever the
+                    # old node fell out of the result set — down-ranking the
+                    # correction it was supposed to prefer.)
+                    if edge.type == EdgeType.SUPERSEDES and tgt in node_by_id:
+                        superseded_map[tgt] = src
                     # Count edges between result set members for spreading activation
                     if src in mem_id_set and tgt in mem_id_set:
                         neighbor_counts[src] = neighbor_counts.get(src, 0) + 1
@@ -808,6 +810,7 @@ class MCPToolHandler:
             filtered = [n for n in nodes_by_id.values() if self._node_passes_filters(n, filters)]
             filtered.sort(key=lambda n: n.last_reactivated_at, reverse=True)
             memories = [self._format_search_hit(n, 0.0) for n in filtered[:k]]
+            await self._tag_superseded(memories)
             return {"query": query, "results": memories, "count": len(memories)}
 
         if not self.embeddings:
@@ -823,7 +826,29 @@ class MCPToolHandler:
                 continue
             memories.append(self._format_search_hit(node, score))
 
+        await self._tag_superseded(memories)
         return {"query": query, "results": memories, "count": len(memories)}
+
+    async def _tag_superseded(self, memories: list[dict[str, Any]]) -> None:
+        """Mark search hits that a newer memory supersedes.
+
+        Recall already tags superseded hits; without this, search/enumeration
+        consumers (e.g. a change-cursor reader) see a superseded memory as
+        indistinguishable from a current one. Direction: new(source) -> old
+        (target), so only edge TARGETS get tagged.
+        """
+        ids = [m["id"] for m in memories if m.get("id")]
+        if not ids:
+            return
+        try:
+            by_id = {m["id"]: m for m in memories if m.get("id")}
+            for edge in await self.graph.get_all_edges(ids):
+                if edge.type == EdgeType.SUPERSEDES:
+                    tgt = str(edge.target_id)
+                    if tgt in by_id:
+                        by_id[tgt]["superseded_by"] = str(edge.source_id)
+        except Exception:
+            logger.warning("superseded tagging failed", exc_info=True)
 
     async def memory_traverse(
         self,
@@ -963,7 +988,12 @@ class MCPToolHandler:
                     "id": str(e.id),
                     "type": e.type.value,
                     "weight": round(e.weight, 4),
+                    # "target" is the OTHER END of the edge viewed from this
+                    # node (legacy name, kept for compatibility). "direction"
+                    # disambiguates: an incoming supersedes edge means the
+                    # other node supersedes THIS one, not vice versa.
                     "target": str(e.target_id) if str(e.source_id) == node_id else str(e.source_id),
+                    "direction": "outgoing" if str(e.source_id) == node_id else "incoming",
                     "reason": e.reason,
                     "created_by": e.created_by,
                     "last_validated_at": e.last_validated_at.isoformat() if e.last_validated_at else None,

@@ -744,3 +744,55 @@ class TestSearchActiveSinceF8:
         ids = {m["id"] for m in res["results"]}
         assert fresh["node_id"] in ids
         assert old["node_id"] not in ids
+
+
+class TestRetestRound2Fixes:
+    """Fixes from the 0.4.0 field retest: conflict precision, supersede
+    direction/visibility, and the latent recall superseder down-ranking."""
+
+    def test_conflict_ignores_cross_quantity_numbers(self):
+        from genesys_memory.engine.contradiction import heuristic_conflict_signal
+        # 200ms latency vs $50,000 budget: different quantities, no conflict.
+        assert heuristic_conflict_signal(
+            "API latency is 200ms after the caching fix",
+            "Project budget is $50,000 for Q3",
+        ) is None
+
+    def test_conflict_ignores_different_units_same_anchor(self):
+        from genesys_memory.engine.contradiction import heuristic_conflict_signal
+        assert heuristic_conflict_signal("the migration took 6 weeks", "the migration took 8 months") is None
+
+    def test_conflict_fires_same_anchor_same_unit(self):
+        from genesys_memory.engine.contradiction import heuristic_conflict_signal
+        assert heuristic_conflict_signal("the budget is $50,000", "the budget is $80,000") == "numeric_mismatch"
+
+    async def test_explain_edge_direction_disambiguates_supersedes(self):
+        h = await _real_handler(_ConstEmbedder())
+        old = await h.memory_store("Rate is $100")
+        amended = await h.memory_amend(old["node_id"], "Rate is now $150", reason="rate change")
+        explained = await h.memory_explain(old["node_id"])
+        sup = [e for e in explained["edges"] if e["type"] == "supersedes"]
+        assert sup and sup[0]["direction"] == "incoming"  # the OTHER node supersedes this one
+        explained_new = await h.memory_explain(amended["node_id"])
+        sup_new = [e for e in explained_new["edges"] if e["type"] == "supersedes"]
+        assert sup_new and sup_new[0]["direction"] == "outgoing"
+
+    async def test_search_enumeration_tags_superseded(self):
+        h = await _real_handler(_ConstEmbedder())
+        old = await h.memory_store("Deadline is June")
+        new = await h.memory_amend(old["node_id"], "Deadline is October")
+        result = await h.memory_search("")
+        by_id = {m["id"]: m for m in result["results"]}
+        assert by_id[old["node_id"]].get("superseded_by") == new["node_id"]
+        assert "superseded_by" not in by_id[new["node_id"]]
+
+    async def test_recall_never_downranks_the_superseder(self):
+        h = await _real_handler(_ConstEmbedder())
+        old = await h.memory_store("Server count is 5")
+        new = await h.memory_amend(old["node_id"], "Server count is 9")
+        # Cap results so the superseded old node falls OUT of the result set:
+        # the old elif then marked the SUPERSEDER as superseded_by the old.
+        result = await h.memory_recall("server count", max_results=1)
+        top = result["results"][0]
+        assert top["id"] == new["node_id"]
+        assert "superseded_by" not in top

@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed (0.4.0 field-retest round 2)
+
+- **Conflict-hint precision**: `possible_conflicts` numeric check now anchors numbers to the nearest *non-stopword* word and carries the number's unit (currency prefix, `%`, or following unit word). "latency is 200ms" no longer flags "budget is $50,000", and "6 weeks" vs "8 months" no longer collide; "budget $50,000" vs "budget $80,000" still fires.
+- **Recall superseder down-ranking (latent)**: when the superseded memory fell outside the result set, recall marked the *superseding* memory as superseded and decayed it. SUPERSEDES is directed new→old; only targets are tagged now.
+- **`memory_explain` edge direction**: edge entries gain a `direction` ("outgoing"/"incoming") field — an incoming `supersedes` edge previously read as if this node superseded the other. Legacy `target` (= other end) unchanged for compatibility.
+- **Search/enumeration supersede visibility**: `memory_search` hits (both modes) now carry `superseded_by`, so change-cursor consumers can distinguish current from superseded memories without traversing edges.
+
 ## [0.4.0] - 2026-07-17
 
 ### Added
