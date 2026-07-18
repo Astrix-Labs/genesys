@@ -82,7 +82,7 @@ Open an issue on GitHub with:
 
 ## Good first issues
 
-Look for issues labeled [`good first issue`](https://github.com/rishimeka/genesys/labels/good%20first%20issue). These are scoped, well-defined tasks suitable for new contributors.
+Look for issues labeled [`good first issue`](https://github.com/Astrix-Labs/genesys/labels/good%20first%20issue). These are scoped, well-defined tasks suitable for new contributors.
 
 ## Code of conduct
 

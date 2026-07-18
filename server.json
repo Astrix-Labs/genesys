@@ -3,7 +3,7 @@
   "name": "io.github.rishimeka/genesys-memory",
   "description": "Causal graph memory engine for AI agents with scoring, activation, and forgetting",
   "repository": {
-    "url": "https://github.com/rishimeka/genesys",
+    "url": "https://github.com/Astrix-Labs/genesys",
     "source": "github"
   },
   "version": "0.5.0",

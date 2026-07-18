@@ -47,9 +47,9 @@ dev = [
 genesys-memory = "genesys_memory.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/rishimeka/genesys"
-Repository = "https://github.com/rishimeka/genesys"
-Issues = "https://github.com/rishimeka/genesys/issues"
+Homepage = "https://github.com/Astrix-Labs/genesys"
+Repository = "https://github.com/Astrix-Labs/genesys"
+Issues = "https://github.com/Astrix-Labs/genesys/issues"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
