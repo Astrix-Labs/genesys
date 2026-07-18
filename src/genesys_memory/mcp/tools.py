@@ -704,7 +704,10 @@ class MCPToolHandler:
                 if _anchor is not None:
                     _boost = engine_config.DATE_RERANK_BOOST
                     for mem in memories:
-                        _node = node_by_id.get(mem.get("id"))
+                        _mem_id = mem.get("id")
+                        if _mem_id is None:
+                            continue
+                        _node = node_by_id.get(_mem_id)
                         if _node is None:
                             continue
                         if node_matches_anchor(
