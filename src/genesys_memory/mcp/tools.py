@@ -49,6 +49,25 @@ def _is_edge_stale(edge: MemoryEdge) -> bool:
     return days > config.EDGE_STALE_DAYS
 
 
+def _stem_plural(term: str) -> str:
+    """Strip a trailing plural so a keyword ILIKE substring match still catches
+    the singular gold turn — I3-2. ``keyword_search`` matches ``content ILIKE
+    '%term%'``, so a query term "cats" never matches a turn that says "cat", and
+    "classes" never matches "class". Stemming the query term to its singular
+    stem ("cat", "class") keeps matching BOTH forms (the stem is a substring of
+    the plural too). Conservative: only long-enough words, never "ss"/"us"/"is"
+    endings. A proper noun that gets shortened ("james"->"jame") still ILIKE-
+    matches its full form, so the broadening is safe."""
+    t = term
+    if len(t) > 4 and t.endswith("ies"):
+        return t[:-3] + "y"                         # stories -> story
+    if len(t) > 4 and t.endswith(("ses", "xes", "zes", "ches", "shes")):
+        return t[:-2]                               # classes -> class, boxes -> box
+    if len(t) > 3 and t.endswith("s") and not t.endswith(("ss", "us", "is")):
+        return t[:-1]                               # cats -> cat, states -> state
+    return t
+
+
 def _parse_iso_utc(value: str) -> datetime:
     """Parse an ISO 8601 string, assuming UTC when no timezone is given.
 
@@ -406,6 +425,7 @@ class MCPToolHandler:
         max_results: int | None = None,
         read_only: bool = False,
         verbosity: str = "full",
+        min_results: int | None = None,
     ) -> dict[str, Any]:
         """Recall memories by hybrid search: vector + keyword, ranked by vector similarity.
 
@@ -414,6 +434,14 @@ class MCPToolHandler:
         superseded_by when set); the expensive causal-chain queries are skipped
         entirely. Reactivation writes still happen in both modes (governed by
         read_only, not verbosity).
+
+        min_results: zero-results floor. When the min-similarity gate would
+        leave fewer than ``min(k, min_results)`` hits, recall backfills with the
+        next-best below-threshold vector hits (each flagged ``low_confidence``)
+        so the answerer always has material. Defaults to
+        ``config.RECALL_RESULT_FLOOR`` (env ``GENESYS_RECALL_RESULT_FLOOR``);
+        pass 0 to disable the backfill and keep strict threshold-only behavior.
+        Threshold semantics for normal, well-populated results are unchanged.
         """
         import asyncio
 
@@ -446,10 +474,19 @@ class MCPToolHandler:
         terms = [w for w in query_words if w.strip("?.,!'\"") not in _stopwords and len(w) > 2]
 
         org_ids = current_org_ids.get([])
+        from genesys_memory.engine import config as engine_config
+        _rrf_on = engine_config.hybrid_rrf_enabled()
         # Run embedding + all keyword searches concurrently. Keyword search
         # coroutines are built once and MUST be awaited on every branch below
-        # (no-embedder recall still relies on the keyword path).
-        kw_coros = [self.graph.keyword_search(t.strip("?.,!'\""), k=k, org_ids=org_ids) for t in terms[:5]]
+        # (no-embedder recall still relies on the keyword path). Under I3-2 the
+        # per-term ILIKE query is plural-stemmed ("cats"->"cat") so a singular
+        # gold turn is still matched; de-duped so a stem collision is one search.
+        _raw_terms = [t.strip("?.,!'\"") for t in terms[:5]]
+        if _rrf_on:
+            search_terms = list(dict.fromkeys(_stem_plural(t) for t in _raw_terms if t))
+        else:
+            search_terms = _raw_terms
+        kw_coros = [self.graph.keyword_search(t, k=k, org_ids=org_ids) for t in search_terms]
         if self.embeddings:
             embed_and_kw: list[Any] = await asyncio.gather(self.embeddings.embed(query), *kw_coros)
             embedding: list[float] = embed_and_kw[0]
@@ -459,25 +496,36 @@ class MCPToolHandler:
             kw_results_per_term = await asyncio.gather(*kw_coros) if kw_coros else []
 
         # 1. Vector search (needs embedding)
-        from genesys_memory.engine import config as engine_config
         min_sim = engine_config.resolve_recall_min_similarity(self.embeddings)
 
         vector_results = await self.graph.vector_search(embedding, k=k, org_ids=org_ids) if embedding else []
 
-        # 2. Collect keyword hits
+        # 2. Collect keyword hits. kw_coverage[nid] = how many distinct query
+        # terms matched this node — the lexical-relevance signal I3-2's RRF ranks
+        # the keyword list by (a node matching three query terms is a stronger
+        # lexical hit than one matching one, independent of its cosine).
         kw_node_ids: set[str] = set()
         kw_nodes_map: dict[str, MemoryNode] = {}
+        kw_coverage: dict[str, int] = {}
         for kw_nodes in kw_results_per_term:
+            seen_this_term: set[str] = set()
             for node in kw_nodes:
                 nid = str(node.id)
                 kw_node_ids.add(nid)
                 kw_nodes_map[nid] = node
+                if nid not in seen_this_term:
+                    seen_this_term.add(nid)
+                    kw_coverage[nid] = kw_coverage.get(nid, 0) + 1
 
         # 3. Merge by union, track vector scores and keyword membership
         from genesys_memory.engine.scoring import cosine_similarity
         merged: dict[str, dict[str, Any]] = {}
 
         vector_ids: set[str] = set()
+        # Below-threshold vector hits retained as fallback material for the
+        # zero-results floor. vector_search returns descending similarity, so
+        # this stays "next-best first" and needs no re-sort.
+        below_threshold: list[tuple[MemoryNode, float]] = []
         for node, score in vector_results:
             nid = str(node.id)
             is_kw_hit = nid in kw_node_ids
@@ -486,6 +534,7 @@ class MCPToolHandler:
             # gated by the vector-similarity floor — only pure vector
             # matches are, to filter embedding noise.
             if score < min_sim and not is_kw_hit:
+                below_threshold.append((node, score))
                 continue
             vector_ids.add(nid)
             merged[nid] = {"node": node, "vec_score": score, "in_both": is_kw_hit}
@@ -500,6 +549,56 @@ class MCPToolHandler:
                     vec_score = 0.0
                 merged[nid] = {"node": node, "vec_score": vec_score, "in_both": False}
 
+        # Zero-results floor: a query that embeds far from everything (inference
+        # or paraphrase questions with little lexical overlap) can leave the
+        # min-similarity gate with almost nothing — starving the answerer even
+        # though k asked for many. When the surviving union is below the floor,
+        # backfill with the next-best below-threshold vector hits, each flagged
+        # low_confidence, up to min(k, floor). This is additive and only fires
+        # on already-starved results; well-populated results are untouched, so
+        # threshold semantics for normal cases are unchanged.
+        result_floor = min_results if min_results is not None else engine_config.RECALL_RESULT_FLOOR
+        floor_target = min(k, result_floor)
+        if len(merged) < floor_target and below_threshold:
+            for node, score in below_threshold:
+                nid = str(node.id)
+                if nid in merged:
+                    continue
+                merged[nid] = {
+                    "node": node,
+                    "vec_score": score,
+                    "in_both": False,
+                    "low_confidence": True,
+                }
+                if len(merged) >= floor_target:
+                    break
+
+        # I3-2 Reciprocal Rank Fusion. Build two rankings over the merged
+        # candidates and fuse them, instead of ranking by cosine + a flat +0.1
+        # keyword nudge. List V = vector order (by cosine). List K = keyword
+        # order (by term COVERAGE desc, cosine as tiebreak). RRF score =
+        # 1/(C+rankV) + 1/(C+rankK); normalized to [0,1] so it composes unchanged
+        # with the downstream core-injection / spreading / superseded stages
+        # (all of which read and write _rank_score on the same scale). A gold
+        # turn buried deep in the vector order but high in the coverage order is
+        # lifted above a single-term distractor that only ranks well on cosine.
+        rrf_c = engine_config.HYBRID_RRF_K
+        vec_rank: dict[str, int] = {}
+        kw_rank: dict[str, int] = {}
+        if _rrf_on:
+            for i, (node, _score) in enumerate(vector_results):
+                nid = str(node.id)
+                if nid not in vec_rank:
+                    vec_rank[nid] = i + 1
+            kw_candidates = [nid for nid in merged if kw_coverage.get(nid, 0) > 0]
+            kw_candidates.sort(
+                key=lambda n: (kw_coverage.get(n, 0), merged[n]["vec_score"]),
+                reverse=True,
+            )
+            for i, nid in enumerate(kw_candidates):
+                kw_rank[nid] = i + 1
+            _rrf_norm = 2.0 / (rrf_c + 1)  # max possible raw score (rank 1 in both)
+
         # 4. Format results without causal chains first (defer expensive graph queries)
         memories = []
         node_by_id: dict[str, MemoryNode] = {}
@@ -507,7 +606,17 @@ class MCPToolHandler:
             node = info["node"]
             node_by_id[nid] = node
             mem = self._format_memory_light(node, info["vec_score"])
-            rank_score = info["vec_score"] + (0.1 if info["in_both"] else 0.0)
+            if info.get("low_confidence"):
+                mem["low_confidence"] = True
+            if _rrf_on:
+                vr = vec_rank.get(nid)
+                kr = kw_rank.get(nid)
+                raw = (1.0 / (rrf_c + vr) if vr else 0.0) + (1.0 / (rrf_c + kr) if kr else 0.0)
+                rank_score = raw / _rrf_norm
+            else:
+                rank_score = info["vec_score"] + (
+                    engine_config.RRF_KEYWORD_BONUS if info["in_both"] else 0.0
+                )
             mem["_rank_score"] = rank_score
             memories.append(mem)
 
@@ -576,6 +685,37 @@ class MCPToolHandler:
                         mem["_rank_score"] += SPREAD_BONUS * spread
             except Exception:
                 logger.warning("Superseded/spreading check failed", exc_info=True)
+
+        # I3-4 date-anchored reranking. For a question carrying an ABSOLUTE date
+        # anchor (a month+year, an explicit date, or a window like "the last two
+        # weeks of August 2023"), boost every retrieved turn whose session date
+        # or resolved [event: ... -> YYYY-MM-DD] date lands inside that window.
+        # BOOST-ONLY and additive: a relative-only or non-date question parses to
+        # no anchor and this is a strict no-op, so the [event:]-resolution path
+        # is never perturbed. Runs before the sort so a buried date-match can rise
+        # into the answer window; a date-match already on top only rises further.
+        if engine_config.date_rerank_enabled():
+            try:
+                from genesys_memory.retrieval.date_anchor import (
+                    node_matches_anchor,
+                    parse_query_date_anchor,
+                )
+                _anchor = parse_query_date_anchor(query)
+                if _anchor is not None:
+                    _boost = engine_config.DATE_RERANK_BOOST
+                    for mem in memories:
+                        _node = node_by_id.get(mem.get("id"))
+                        if _node is None:
+                            continue
+                        if node_matches_anchor(
+                            _node.content_full or _node.content_summary,
+                            _node.created_at,
+                            _anchor,
+                        ):
+                            mem["_rank_score"] += _boost
+                            mem["date_anchor_boosted"] = True
+            except Exception:
+                logger.warning("Date-anchored rerank failed", exc_info=True)
 
         memories.sort(key=lambda m: m["_rank_score"], reverse=True)
         for mem in memories:
@@ -690,6 +830,8 @@ class MCPToolHandler:
                 }
                 if "superseded_by" in mem:
                     c["superseded_by"] = mem["superseded_by"]
+                if mem.get("low_confidence"):
+                    c["low_confidence"] = True
                 concise.append(c)
             return {"query": query, "results": concise, "count": len(concise)}
 

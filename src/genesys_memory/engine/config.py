@@ -23,6 +23,18 @@ def _float_override(key: str) -> float | None:
     return float(val) if val is not None else None
 
 
+def _bool_live(key: str, default: bool = False) -> bool:
+    """Read a boolean env flag *live* (not frozen at import).
+
+    Truthy: 1/true/yes/on (case-insensitive). Reading live lets a process set
+    the flag after import and lets tests monkeypatch it without a config reload.
+    """
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 # ---------------------------------------------------------------------------
 # ACT-R Scoring (scoring.py)
 # ---------------------------------------------------------------------------
@@ -85,6 +97,19 @@ CORE_INJECT_MIN_SIMILARITY_OTHER_DEFAULT = 0.2
 RECALL_MIN_SIMILARITY_OVERRIDE = _float_override("GENESYS_RECALL_MIN_SIMILARITY")
 CORE_INJECT_MIN_SIMILARITY_OVERRIDE = _float_override("GENESYS_CORE_INJECT_MIN_SIMILARITY")
 
+# Zero-results floor for memory_recall. The min-similarity gate above filters
+# pure-vector hits that fall below the (embedder-dependent) floor. For a query
+# that embeds far from everything — inference/paraphrase questions with little
+# lexical overlap — that gate can gut the result set to near-empty, starving
+# the answerer of material even though k asked for many. When the surviving
+# union is smaller than min(k, RECALL_RESULT_FLOOR), recall backfills with the
+# next-best BELOW-threshold vector hits (flagged low_confidence) up to the
+# floor. This does NOT change threshold semantics for normal (well-populated)
+# results — it only fires when results are already starved. Set to 0 to disable
+# the backfill entirely and restore strict threshold-only behavior. A per-call
+# `min_results` argument to memory_recall overrides this default.
+RECALL_RESULT_FLOOR = _int("GENESYS_RECALL_RESULT_FLOOR", "10")
+
 # Retained for backward compatibility with any external readers of the old
 # single-value constants; reflects the OpenAI-tuned default (or the explicit
 # env override). Prefer resolve_recall_min_similarity()/
@@ -137,6 +162,56 @@ def resolve_core_inject_min_similarity(embeddings: object | None) -> float:
         return CORE_INJECT_MIN_SIMILARITY_OVERRIDE
     recommended = _embedder_recommended(embeddings, "recommended_core_min_similarity")
     return recommended if recommended is not None else CORE_INJECT_MIN_SIMILARITY_OTHER_DEFAULT
+
+# ---------------------------------------------------------------------------
+# Hybrid retrieval fusion — I3-2 (tools.py — memory_recall)
+# ---------------------------------------------------------------------------
+# The recall union of vector hits + per-term keyword hits is, by default, ranked
+# by the vector cosine of the FULL query with only a flat +0.1 nudge for keyword
+# membership (RRF_KEYWORD_BONUS). Two persistent failure modes survive that
+# scheme (G2-P mechanism annotation, Day 3):
+#   * WRONG_INSTANCE_RETRIEVAL — both candidate turns are retrieved but the wrong
+#     one outranks (the gold turn matches MORE disambiguating query terms yet its
+#     lower full-question cosine buries it; +0.1 can't close the gap).
+#   * RETRIEVAL_MISS — a genuine keyword hit sits below the top-k cut because its
+#     cosine is low and +0.1 is too small to lift it into the window.
+# GENESYS_HYBRID_RRF turns on proper Reciprocal Rank Fusion of two rankings — the
+# vector list (by cosine) and a keyword list (by term COVERAGE, i.e. how many
+# distinct query terms a node matched, tie-broken by cosine). RRF's reciprocal-
+# rank damping lets multi-term agreement outweigh a single strong cosine hit,
+# while its bounded contribution stops a common term from dominating. The fused
+# score is normalized to [0,1] so it composes unchanged with the existing core
+# injection, spreading-activation, and superseded-decay stages. It also stems
+# trailing plurals off keyword terms ("cats"->"cat") so a singular gold turn is
+# matched. Flag OFF (default) reproduces the +0.1-bonus behaviour byte-for-byte.
+HYBRID_RRF_K = _int("GENESYS_HYBRID_RRF_K", "60")
+# Legacy flat in-both bonus (used when RRF is OFF; unchanged historical value).
+RRF_KEYWORD_BONUS = _float("GENESYS_RRF_KEYWORD_BONUS", "0.1")
+
+
+def hybrid_rrf_enabled() -> bool:
+    """True iff I3-2 RRF fusion + keyword plural-stemming is enabled (env, live)."""
+    return _bool_live("GENESYS_HYBRID_RRF", False)
+
+
+# ---------------------------------------------------------------------------
+# Date-anchored reranking — I3-4 (tools.py — memory_recall)
+# ---------------------------------------------------------------------------
+# For a date-SCOPED question (one carrying an absolute date anchor — a month+year,
+# an explicit date, or a date window like "the last two weeks of August 2023"),
+# boost retrieved turns whose session date or resolved [event: ... -> YYYY-MM-DD]
+# date falls inside the anchor window. Additive and BOOST-ONLY: it can only lift a
+# date-matching turn, never demote one, so a query with no parseable absolute
+# anchor (all relative-temporal and non-temporal questions) is a strict no-op —
+# this is what keeps it off the [event:]-resolution path that carries Temporal's
+# net gain. Flag OFF (default) is a byte-for-byte no-op.
+DATE_RERANK_BOOST = _float("GENESYS_DATE_RERANK_BOOST", "0.25")
+
+
+def date_rerank_enabled() -> bool:
+    """True iff I3-4 date-anchored reranking is enabled (env, live)."""
+    return _bool_live("GENESYS_DATE_RERANK", False)
+
 
 # ---------------------------------------------------------------------------
 # Auto-linking (tools.py — memory_store)

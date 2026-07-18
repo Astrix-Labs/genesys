@@ -823,3 +823,113 @@ class TestTraverseIncludesStartNode:
         res = await h.memory_traverse(a["node_id"], depth=2, edge_types=["supersedes"])
         assert res["edge_count"] >= 1, "edge_types filter dropped the only (start-incident) supersedes edge"
         assert all(e["type"] == "supersedes" for e in res["edges"])
+
+
+class _FloorEmbedder:
+    """Embedder that makes a sentinel query orthogonal to every stored node.
+
+    Stored text hashes onto one of axes 0..14 (cosine 1.0 within an axis, 0.0
+    across axes). A query beginning with ``QRY::`` maps to axis 15 — orthogonal
+    to all stored content (cosine 0.0), which sits below every recall floor. It
+    exposes no ``recommended_min_similarity``, so resolve_recall_min_similarity
+    falls back to the 0.2 non-OpenAI default and the query's 0.0 hits are all
+    gated out — the exact starvation the zero-results floor must backfill.
+    """
+
+    _DIM = 16
+
+    @property
+    def dimension(self):
+        return self._DIM
+
+    async def embed(self, text):
+        import hashlib
+
+        vec = [0.0] * self._DIM
+        if text.startswith("QRY::"):
+            vec[15] = 1.0
+        else:
+            seed = int(hashlib.sha256(text.encode()).hexdigest(), 16)
+            vec[seed % 15] = 1.0
+        return vec
+
+    async def embed_batch(self, texts):
+        return [await self.embed(t) for t in texts]
+
+
+class TestRecallZeroResultsFloorI3:
+    """I3-1: the min-similarity gate must FLOOR the result count, not gut it.
+
+    When a query embeds far from everything and shares no keywords, every pure
+    vector hit is below the floor and the surviving union collapses to near
+    empty. Recall must backfill the next-best below-threshold hits (flagged
+    low_confidence) up to min(k, floor) so the answerer always has material —
+    without changing threshold semantics for well-populated results.
+    """
+
+    async def _seed(self, h, n=15):
+        for i in range(n):
+            await h.memory_store(f"stored fact {i} regarding subject alpha bravo charlie")
+
+    @pytest.mark.asyncio
+    async def test_starved_recall_backfills_to_floor_flagged_low_confidence(self):
+        from genesys_memory.engine import config
+
+        h = await _real_handler(_FloorEmbedder())
+        await self._seed(h)
+        rec = await h.memory_recall("QRY:: zqxwv nonmatching token", k=60)
+        expected = min(60, config.RECALL_RESULT_FLOOR)
+        assert rec["count"] == expected, (
+            f"expected floor of {expected} results, got {rec['count']} — "
+            "the gate gutted the set instead of flooring it"
+        )
+        assert all(m.get("low_confidence") for m in rec["results"]), (
+            "every backfilled hit must be flagged low_confidence"
+        )
+
+    @pytest.mark.asyncio
+    async def test_min_results_param_overrides_default_floor(self):
+        h = await _real_handler(_FloorEmbedder())
+        await self._seed(h)
+        rec = await h.memory_recall("QRY:: zqxwv nonmatching token", k=60, min_results=5)
+        assert rec["count"] == 5
+        assert all(m.get("low_confidence") for m in rec["results"])
+
+    @pytest.mark.asyncio
+    async def test_floor_disabled_keeps_strict_threshold(self):
+        # min_results=0 restores strict threshold-only behavior: no backfill.
+        h = await _real_handler(_FloorEmbedder())
+        await self._seed(h)
+        rec = await h.memory_recall("QRY:: zqxwv nonmatching token", k=60, min_results=0)
+        assert rec["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_floor_capped_by_k(self):
+        # floor_target = min(k, floor): a small k must not be exceeded.
+        h = await _real_handler(_FloorEmbedder())
+        await self._seed(h)
+        rec = await h.memory_recall("QRY:: zqxwv nonmatching token", k=3)
+        assert rec["count"] == 3
+        assert all(m.get("low_confidence") for m in rec["results"])
+
+    @pytest.mark.asyncio
+    async def test_well_populated_results_untouched(self):
+        # Keyword hits populate the union above the floor: no backfill, and no
+        # real hit is mislabeled low_confidence — normal-case semantics unchanged.
+        h = await _real_handler(_FloorEmbedder())
+        await self._seed(h)
+        rec = await h.memory_recall("subject alpha bravo charlie", k=60)
+        assert rec["count"] >= 10
+        assert not any(m.get("low_confidence") for m in rec["results"]), (
+            "well-populated recall must not carry low_confidence backfill"
+        )
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_surfaces_in_concise_mode(self):
+        h = await _real_handler(_FloorEmbedder())
+        await self._seed(h)
+        rec = await h.memory_recall(
+            "QRY:: zqxwv nonmatching token", k=60, verbosity="concise"
+        )
+        assert rec["count"] >= 1
+        assert all(m.get("low_confidence") for m in rec["results"])
