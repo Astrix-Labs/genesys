@@ -10,6 +10,16 @@
 
 > Genesys doesn't just remember what happened; it remembers why. A scoring engine + causal graph + lifecycle manager for AI agent memory. Speaks MCP natively.
 
+## LoCoMo benchmark (certified)
+
+| System | Score | Protocol |
+|---|---|---|
+| **Genesys Memory** | **85.55 ± 0.37** | Frozen: gpt-4o-mini answerer + judge, temp 0, n=1,540, cats 1–4, 10 runs (July 2026) |
+| Zep | 75.14 | Comparable published setup |
+| Mem0 | 66.9 | Comparable published setup (Mem0 paper) |
+
+Self-reported vendor figures above ~90 use different answerers/judges and are not comparable — the oracle retrieval ceiling under this frozen protocol is 94.9. Reproduce it yourself: [Astrix-Labs/locomo-harness](https://github.com/Astrix-Labs/locomo-harness) · [full methodology](https://genesys.astrixlabs.ai/developers/methodology) · [per-run results](https://genesys.astrixlabs.ai/benchmarks/locomo).
+
 **Hosted product:** [genesys.astrixlabs.ai](https://genesys.astrixlabs.ai) — your personal memory for AI, carried across ChatGPT, Claude, and every MCP app · [Pricing](https://genesys.astrixlabs.ai/pricing) · [Developer docs](https://genesys.astrixlabs.ai/developers) · [Benchmark methodology](https://genesys.astrixlabs.ai/developers/methodology) (85.55 on LoCoMo, certified over 10 runs, receipts published)
 <img width="1512" height="827" alt="image" src="https://github.com/user-attachments/assets/d152aa07-a852-4b8e-9f98-942d0bebd497" />
 
