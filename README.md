@@ -9,6 +9,8 @@
 **The intelligence layer for AI memory.**
 
 > Genesys doesn't just remember what happened; it remembers why. A scoring engine + causal graph + lifecycle manager for AI agent memory. Speaks MCP natively.
+
+**Hosted product:** [genesys.astrixlabs.ai](https://genesys.astrixlabs.ai) — your personal memory for AI, carried across ChatGPT, Claude, and every MCP app · [Pricing](https://genesys.astrixlabs.ai/pricing) · [Developer docs](https://genesys.astrixlabs.ai/developers) · [Benchmark methodology](https://genesys.astrixlabs.ai/developers/methodology) (85.55 on LoCoMo, certified over 10 runs, receipts published)
 <img width="1512" height="827" alt="image" src="https://github.com/user-attachments/assets/d152aa07-a852-4b8e-9f98-942d0bebd497" />
 
 ## What is this
